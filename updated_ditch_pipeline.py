@@ -25,6 +25,8 @@ in the opposite direction, so cross-sections are later oriented with
 information to project points back into world XY for export.
 """
 
+#python updated_ditch_pipeline.py --sidewalk-las "02\segments\part2\Sidewalk.las" --lane-las "02\segments\part2\Road.las" --traj-csv "02\segments\part2\traj.csv"
+#python remap_station_side_classes.py --base "C:\Users\jianjing\Desktop\Fiseha\Ramp_Detection\01\segments\part4 - Copy\traj" --apply
 from __future__ import annotations
 
 import argparse
@@ -1090,7 +1092,12 @@ def classify_side(v_lane: np.ndarray, z_lane: np.ndarray, v_side: np.ndarray, z_
     dbg.update({"curb_from_interface": curb_from_interface, "curb_from_kink": curb_from_kink, "curb_eval_mode": curb_eval_mode, "is_curb": is_curb, "is_ditch": is_ditch, "priority_mode": "ditch_over_curb" if config.ditch_priority_over_curb else "curb_over_ditch", "priority_mode_effective": "curb_override_over_ditch" if curb_priority_override else ("ditch_over_curb" if config.ditch_priority_over_curb else "curb_over_ditch"), "curb_priority_override": curb_priority_override, "curb_priority_slope": used_curb_slope, "curb_override_slope_thresh": curb_override_slope_thresh, "ambiguous": ambiguous})
 
     curb_result = {"class": "CURB_NO_RAMP", "gap_m": gap, "dz_edge": curb_info.get("dz_edge", np.nan), "edge_slope": curb_info.get("edge_slope", np.nan), "dz_m": dz, "slope": slope, "dz_source": dz_source, "curb_source": curb_eval_mode, "curb_priority_override": curb_priority_override, "ambiguous": ambiguous}
-    ditch_result = {"class": "DEPRESSED_DITCH", "depth_m": ditch_info["valley_depth"], "ditch_center_v": ditch_info["vmin"], "ditch_width50_m": ditch_info["valley_width_50"], "ditch_width30_m": ditch_info["valley_width_30"], "ditch_curv": ditch_info["valley_curv"], "gap_m": gap, "dz_edge": curb_info.get("dz_edge", np.nan), "edge_slope": curb_info.get("edge_slope", np.nan), "curb_candidate": bool(is_curb), "curb_priority_override": curb_priority_override, "dz_m": dz, "slope": slope, "dz_source": dz_source, "ambiguous": ambiguous}
+
+    # Only build the ditch class payload after classify_ditch has actually
+    # reported a ditch. Sparse/invalid ditch windows intentionally return early
+    # without valley metrics such as valley_depth and vmin.
+    def ditch_result() -> dict:
+        return {"class": "DEPRESSED_DITCH", "depth_m": ditch_info["valley_depth"], "ditch_center_v": ditch_info["vmin"], "ditch_width50_m": ditch_info["valley_width_50"], "ditch_width30_m": ditch_info["valley_width_30"], "ditch_curv": ditch_info["valley_curv"], "gap_m": gap, "dz_edge": curb_info.get("dz_edge", np.nan), "edge_slope": curb_info.get("edge_slope", np.nan), "curb_candidate": bool(is_curb), "curb_priority_override": curb_priority_override, "dz_m": dz, "slope": slope, "dz_source": dz_source, "ambiguous": ambiguous}
 
     # Current notebook default is curb-over-ditch. The alternate mode is kept
     # because it is a real classifier option, but it is not enabled by default.
@@ -1098,14 +1105,14 @@ def classify_side(v_lane: np.ndarray, z_lane: np.ndarray, v_side: np.ndarray, z_
         if curb_priority_override:
             return curb_result, dbg
         if is_ditch:
-            return ditch_result, dbg
+            return ditch_result(), dbg
         if is_curb:
             return curb_result, dbg
     else:
         if is_curb:
             return curb_result, dbg
         if is_ditch:
-            return ditch_result, dbg
+            return ditch_result(), dbg
 
     dbg["ramp_dz_source"] = dz_source
     return {"class": "RAMP", "dz_m": dz, "slope": slope, "transition_width_m": width, "kink1_v": kink1, "kink2_v": kink2, "gap_m": gap, "dz_source": dz_source, "curb_priority_override": curb_priority_override, "ambiguous": ambiguous}, dbg
