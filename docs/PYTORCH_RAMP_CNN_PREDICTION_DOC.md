@@ -66,10 +66,10 @@ For each station-side sample keyed by rounded `(s_m, side)`:
 1. Load Stage 1 sidewalk and lane CSVs.
 2. Normalize side labels and rounded station keys.
 3. Rebuild the same profile tensor structure used for training:
-   - `z_000 ... z_191`
-   - `gap_000 ... gap_191`
-   - `pad_000 ... pad_191`
-4. Apply the same edge-window crop used by the focused training dataset.
+   - `z_000 ... z_024`
+   - `gap_000 ... gap_024`
+   - `pad_000 ... pad_024`
+4. Apply the same sidewalk-edge-buffer crop used by the focused training dataset.
 5. Recompute scalar engineered features using Stage 1 classifier logic in `ramp_prediction_helpers.py`:
    - `feat_kink_dz`
    - `feat_kink_slope`
@@ -85,9 +85,9 @@ For each station-side sample keyed by rounded `(s_m, side)`:
 
 ## Profile Construction
 
-Prediction mirrors the dataset creation notebook. By default it bins the full merged lane/sidewalk profile. The previous lane/sidewalk edge-window crop and `EDGE_BUFFER_M` logic has been removed from `ramp_prediction_helpers.py`.
+Prediction mirrors the dataset creation notebook. By default it applies the sidewalk-edge buffer and bins a 25-bin profile around `abs(side_edge_v)`. The previous lane/sidewalk edge-window crop and `EDGE_BUFFER_M` logic has been removed from `ramp_prediction_helpers.py`.
 
-When `USE_SIDEWALK_EDGE_BUFFER = True`, prediction crops around `abs(side_edge_v)`, shifts the buffer start to `v = 0`, and bins the sidewalk-centered window with `SIDEWALK_EDGE_N_BINS`.
+When `USE_SIDEWALK_EDGE_BUFFER = True`, prediction crops around `abs(side_edge_v)`, shifts the buffer start to `v = 0`, and bins the sidewalk-centered window with `SIDEWALK_EDGE_N_BINS = 25`. If disabled, prediction falls back to the full merged profile with `FULL_PROFILE_N_BINS = 192`.
 
 Prediction rows include buffer audit metadata:
 
@@ -143,7 +143,7 @@ The prediction notebook intentionally mirrors the training input structure from 
 
 The model input has:
 
-- profile tensor shape `(N, 3, 192)`
+- profile tensor shape `(N, 3, 25)`
 - scalar feature tensor shape `(N, 2)`
 
 The three profile channels are:

@@ -20,9 +20,9 @@ Each CSV should already contain:
 
 ### Per-bin channels
 
-- `z_000 ... z_191`
-- `gap_000 ... gap_191`
-- `pad_000 ... pad_191`
+- `z_000 ... z_024`
+- `gap_000 ... gap_024`
+- `pad_000 ... pad_024`
 
 ### Scalar engineered features
 
@@ -61,7 +61,7 @@ The notebook currently supports two split modes.
 
 ### Profile branch
 
-Uses a 1D CNN on the three profile channels:
+Uses a 1D CNN on the three 25-bin profile channels:
 
 - `z`
 - `gap`
@@ -74,7 +74,9 @@ Current backbone:
 - `Conv1d(128 -> 128, k=3)`
 - `BatchNorm + LeakyReLU`
 - `MaxPool` after first two blocks
+- channel attention after the convolution stack
 - `AdaptiveAvgPool1d`
+- profile embedding head `Linear(128 -> 64)`
 
 ### Feature branch
 
@@ -88,6 +90,8 @@ When `USE_SCALAR_FEATURES = True`, uses a small MLP on the scalar engineered fea
 With scalar features enabled, the profile and feature embeddings are concatenated and fed to a final classifier head.
 
 With `USE_SCALAR_FEATURES = False`, the model skips the scalar branch and trains a profile-only CNN. The classifier still outputs the same three classes.
+
+The current `N_BINS` setting is `25`, matching the sidewalk-edge-buffer dataset rows.
 
 ## Normalization
 

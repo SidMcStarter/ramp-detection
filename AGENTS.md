@@ -1,6 +1,6 @@
 # Ramp Detection Pipeline Overview
 
-This repository now has a three-stage training pipeline plus a prediction notebook:
+This repository has a three-stage training pipeline plus a prediction notebook:
 
 1. `updated_ditch_latest_version.ipynb`
 2. `cnn_dataset_from_remapped_and_lane_csv.ipynb`
@@ -53,7 +53,8 @@ It does the following:
 - loads one station-side metrics CSV exported from Stage 1
 - groups data by `(s_m, side)`
 - merges sidewalk and lane points into one 1D lateral profile
-- bins into 192 fixed-width bins
+- crops the model profile around the Stage 1 sidewalk edge by default
+- bins into 25 fixed-width bins when the sidewalk-edge buffer is enabled
 - interpolates internal gaps
 - smooths only through `last_valid_bin`
 - zero-pads the trailing region
@@ -61,9 +62,9 @@ It does the following:
 
 Current per-bin channels:
 
-- `z_000 ... z_191`
-- `gap_000 ... gap_191`
-- `pad_000 ... pad_191`
+- `z_000 ... z_024`
+- `gap_000 ... gap_024`
+- `pad_000 ... pad_024`
 
 Current scalar engineered features:
 
@@ -75,6 +76,7 @@ Current edge metadata:
 - `lane_edge_v`
 - `side_edge_v`
 - `interface_center_v`
+- sidewalk-edge buffer audit columns such as `profile_mode`, `buffer_applied`, and `sidewalk_edge_center_bin`
 
 Other important row metadata:
 
@@ -93,7 +95,7 @@ Important design rule:
 - the metrics CSV from Stage 1 is merged by rounded `s_m` plus `side`
 - scalar engineered features live in the same final row as the profile channels
 - this keeps later train/validation splits automatically aligned
-- profiles are currently binned from the full merged lane/sidewalk profile; the previous edge-window buffer crop has been removed
+- profiles are currently binned from a sidewalk-edge-centered buffer by default; set `USE_SIDEWALK_EDGE_BUFFER = False` to use the full 192-bin merged lane/sidewalk profile
 
 ## Stage 3 - PyTorch Training
 
@@ -107,14 +109,14 @@ It currently does the following:
   - `folder_holdout`
 - applies optional per-class caps to training data
 - optionally augments only training `RAMP` rows by applying minute perturbations to valid `z_*`
-- builds a profile tensor branch from `z/gap/pad`
+- builds a profile tensor branch from the 25-bin `z/gap/pad` sidewalk-edge-buffer channels
 - builds a scalar feature branch from `feat_kink_dz` and `feat_kink_slope`
 - trains a PyTorch hybrid model
 - selects best checkpoint by validation macro F1
 
 Current model structure:
 
-- CNN branch on profile channels `(3, 192)`
+- CNN branch on profile channels `(3, 25)`
 - small MLP branch on scalar feature vector `(2,)`
 - concatenated classifier head
 
@@ -139,8 +141,7 @@ It currently does the following:
 
 - loads one Stage 1 `*_sidewalk.csv`
 - loads one Stage 1 `*_lane.csv`
-- rebuilds the same `z/gap/pad` profile channels used for training
-- builds the same full-profile `z/gap/pad` channels used by the current training dataset
+- rebuilds the same 25-bin sidewalk-edge-buffer `z/gap/pad` profile channels used for training
 - recomputes `feat_kink_dz` and `feat_kink_slope` using helper functions refactored from Stage 1
 - skips CNN inference for station-sides without valid kink features, such as `NO_SIDEWALK` and `SEPARATED_NO_RAMP`
 - loads `ramp_cnn_pytorch.pt` and `ramp_cnn_pytorch_meta.json`

@@ -38,13 +38,14 @@ For each station-side sample keyed by `(s_m, side)`:
 2. Load lane points from the lane CSV
 3. Merge sidewalk and lane points into one 1D lateral profile
 4. Keep only configured target labels
-5. Bin into 192 fixed-width bins
-6. Mark real bins, gap-interpolated bins, and padded bins
-7. Interpolate internal gaps only
-8. Smooth only through `last_valid_bin`
-9. Zero-pad the trailing region
-10. Merge scalar metrics from `*_station_side_metrics.csv`
-11. Write one final row to `cnn_dataset.csv`
+5. Apply the sidewalk-edge buffer by default
+6. Bin into 25 fixed-width bins when the buffer is enabled
+7. Mark real bins, gap-interpolated bins, and padded bins
+8. Interpolate internal gaps only
+9. Smooth only through `last_valid_bin`
+10. Zero-pad the trailing region
+11. Merge scalar metrics from `*_station_side_metrics.csv`
+12. Write one final row to `cnn_dataset.csv`
 
 ## Output Structure
 
@@ -52,9 +53,9 @@ Each row in `cnn_dataset.csv` represents one `(s_m, side)` sample.
 
 ### Per-bin channels
 
-- `z_000 ... z_191`
-- `gap_000 ... gap_191`
-- `pad_000 ... pad_191`
+- `z_000 ... z_024`
+- `gap_000 ... gap_024`
+- `pad_000 ... pad_024`
 
 Definitions:
 
@@ -78,9 +79,9 @@ Both are currently converted to absolute values when loaded so opposite signs do
 
 ### Sidewalk-edge buffer metadata
 
-The previous lane/sidewalk edge-window crop and `EDGE_BUFFER_M` logic has been removed. The notebook now supports an optional sidewalk-centered buffer controlled by `USE_SIDEWALK_EDGE_BUFFER`.
+The previous lane/sidewalk edge-window crop and `EDGE_BUFFER_M` logic has been removed. The notebook now uses a sidewalk-centered buffer controlled by `USE_SIDEWALK_EDGE_BUFFER`.
 
-When the flag is disabled, `profile_mode = "full_profile"` and the full merged lane/sidewalk profile is binned. When enabled, the profile is cropped around `abs(side_edge_v)`, shifted so the start of the buffer is `v = 0`, and binned with `SIDEWALK_EDGE_N_BINS`.
+The current default is `USE_SIDEWALK_EDGE_BUFFER = True`, so `profile_mode = "sidewalk_edge_buffer"`. The profile is cropped around `abs(side_edge_v)`, shifted so the start of the buffer is `v = 0`, and binned with `SIDEWALK_EDGE_N_BINS = 25`. If the flag is disabled, `profile_mode = "full_profile"` and the full merged lane/sidewalk profile is binned with `FULL_PROFILE_N_BINS = 192`.
 
 The output carries buffer audit metadata:
 
@@ -130,16 +131,14 @@ The current default settings are:
 - `BIN_SIZE = 0.08`
 - `FULL_PROFILE_N_BINS = 192`
 - `SIDEWALK_EDGE_N_BINS = 25`
-- `USE_SIDEWALK_EDGE_BUFFER = False`
+- `USE_SIDEWALK_EDGE_BUFFER = True`
 - `N_BINS = SIDEWALK_EDGE_N_BINS if USE_SIDEWALK_EDGE_BUFFER else FULL_PROFILE_N_BINS`
 - `MIN_PTS_PER_BIN = 3`
 - `SG_WINDOW = 11`
 - `SG_POLY = 4`
 - `SIDEWALK_EDGE_BUFFER_M = 1.0`
 
-The sidewalk-edge buffer helper is present but not yet wired into sample construction. With `USE_SIDEWALK_EDGE_BUFFER = False`, the notebook keeps the full-profile default.
-
-When enabled in a later wiring step, the helper will crop to:
+The sidewalk-edge buffer helper is wired into sample construction. With the current default, each sample is cropped to:
 
 ```text
 abs(side_edge_v) - SIDEWALK_EDGE_BUFFER_M
