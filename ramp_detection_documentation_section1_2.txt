@@ -1,0 +1,2403 @@
+\documentclass{article}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{geometry}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\geometry{margin=1in}
+
+\title{Ramp Detection Documentation}
+\author{Siddharth Dileep}
+\date{June 2026}
+
+\begin{document}
+\maketitle
+
+\section{Introduction}
+The primary goal of this pipeline is to automatically classify the physical infrastructure along a road corridor. As a vehicle travels along a trajectory, the system evaluates the left and right sides of the road at regular intervals, known as stations. At each station, the algorithm analyzes 3D point cloud data to determine the type of pedestrian transition present.
+
+Specifically, the pipeline classifies each side of a station into one of the following categories:
+\begin{itemize}
+    \item \textbf{RAMP:} A smooth, gradual transition designed for accessibility.
+    \item \textbf{CURB\_NO\_RAMP:} A standard vertical curb step without a wheelchair ramp.
+    \item \textbf{DEPRESSED\_DITCH:} A drainage channel or local depression near the edge of the road.
+    \item \textbf{SEPARATED\_NO\_RAMP:} A sidewalk that exists but is separated from the road by a large gap (e.g., a grass boulevard).
+    \item \textbf{NO\_SIDEWALK:} No pedestrian infrastructure is detected.
+    \item \textbf{UNKNOWN:} The geometric data is too noisy, sparse, or ambiguous to make a reliable decision.
+\end{itemize}
+
+By dividing the road corridor into individual left and right ``station-sides,'' the pipeline transforms raw, unstructured 3D data into a structured, station-by-station classification of street-level infrastructure.
+
+\subsection{Pipeline Overview}
+The pipeline works by converting the raw corridor point cloud into a sequence of local geometric classification problems. Instead of attempting to classify the entire road segment at once, the road is sampled at fixed station intervals. Each station is split into a left and right side, and each station-side is evaluated independently.
+
+At a high level, the process is:
+\begin{enumerate}
+    \item Follow the trajectory and sample stations at fixed spacing.
+    \item At each station, build a local coordinate system aligned with the road direction.
+    \item Extract nearby lane and sidewalk points inside a thin cross-section slab.
+    \item Separate the extracted points into left and right station-sides.
+    \item Build a lateral elevation profile $z(v)$ for each station-side.
+    \item Analyze geometric features such as gap, height step, slope, curvature, and valley shape.
+    \item Assign a rule-based class such as \textbf{RAMP}, \textbf{CURB\_NO\_RAMP}, or \textbf{DEPRESSED\_DITCH}.
+\end{enumerate}
+
+This station-side representation is important because the left and right sides of the same road station can have different infrastructure. For example, the right side may contain a curb while the left side contains a depressed ditch or no sidewalk.
+
+\subsection{Relevant Code}
+The main non-notebook implementation for this stage is:
+
+\begin{itemize}
+    \item \texttt{updated\_ditch\_pipeline.py}
+\end{itemize}
+
+The relevant functions for the introduction-level workflow are:
+
+\begin{itemize}
+    \item \texttt{load\_inputs}: loads the trajectory, sidewalk point cloud, lane point cloud, and builds spatial search structures.
+    \item \texttt{build\_corridor\_results}: walks along the trajectory and extracts station-level cross-section data.
+    \item \texttt{classify\_corridor}: classifies each station-side after cross-section extraction.
+    \item \texttt{export\_outputs}: writes sidewalk, lane, trajectory, and station-side metric outputs.
+\end{itemize}
+
+Conceptually, the rule-based stage follows this structure:
+
+\begin{verbatim}
+load trajectory, sidewalk points, and lane points
+build station axis along trajectory
+for each station:
+    compute local tangent and normal
+    extract nearby lane and sidewalk points
+    split points into RIGHT and LEFT station-sides
+    classify each station-side
+write point-level and station-side outputs
+\end{verbatim}
+
+\section{Coordinate System and Corridor Sampling}
+To analyze the road infrastructure accurately, the pipeline avoids global coordinates alone, such as absolute GPS or UTM positions, and instead builds a dynamic local coordinate system at every station along the road.
+
+Let the vehicle trajectory be defined as a curve parameterized by cumulative distance, or station coordinate, $s$. At any given station anchor point $\mathbf{p}(s)$, the pipeline establishes a local 2D frame using two orthogonal unit vectors:
+
+\begin{itemize}
+    \item $s$: The cumulative station distance along the trajectory.
+    \item $\mathbf{p}(s)$: The anchor point for the current station.
+    \item $\hat{t}$: The local tangent vector, pointing forward along the trajectory.
+    \item $\hat{n}$: The local normal vector, computed as a $90^\circ$ clockwise rotation of $\hat{t}$.
+\end{itemize}
+
+For an arbitrary point cloud point $\mathbf{q} = (x, y)$, the pipeline computes its local station coordinates by projecting the relative vector $\mathbf{q} - \mathbf{p}$ onto the tangent and normal directions:
+
+\begin{align}
+    u &= (\mathbf{q} - \mathbf{p}) \cdot \hat{t} \\
+    v &= (\mathbf{q} - \mathbf{p}) \cdot \hat{n}
+\end{align}
+
+In this system:
+\begin{itemize}
+    \item $u$ represents the \textbf{along-road distance}: how far ahead or behind the current station the point lies.
+    \item $v$ represents the \textbf{lateral distance}: how far left or right of the trajectory the point lies.
+    \item $z$ remains the point elevation from the original point cloud.
+\end{itemize}
+
+This converts every nearby 3D point $(x,y,z)$ into a station-local representation $(u,v,z)$.
+
+\subsection{Projection Example}
+Suppose a station anchor is located at
+\[
+    \mathbf{p} = (100.0, 200.0)
+\]
+and the local road tangent is pointing east:
+\[
+    \hat{t} = (1, 0).
+\]
+Using a $90^\circ$ clockwise rotation, the right-facing normal vector is:
+\[
+    \hat{n} = (0, -1).
+\]
+
+Now consider a point cloud point:
+\[
+    \mathbf{q} = (100.3, 198.8).
+\]
+The relative vector is:
+\[
+    \mathbf{q} - \mathbf{p} = (0.3, -1.2).
+\]
+
+Therefore,
+\[
+    u = (0.3, -1.2) \cdot (1, 0) = 0.3
+\]
+and
+\[
+    v = (0.3, -1.2) \cdot (0, -1) = 1.2.
+\]
+
+This point lies $0.3$ meters ahead of the current station and $1.2$ meters to the right of the trajectory. If $\text{half\_thick\_u}=0.4$, then this point is included in the station cross-section because:
+\[
+    |u| = |0.3| \le 0.4.
+\]
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.9\linewidth]{figure1.png}
+\caption{Trajectory sanity-check plot showing the sampled trajectory, selected station point, forward tangent vector $\hat{t}$, and right-facing normal vector $\hat{n}$.}
+\label{fig:trajectory_sanity_check}
+\end{figure}
+
+\subsection{Cross-Section Extraction}
+Rather than analyzing the entire point cloud at once, the algorithm extracts a thin, perpendicular slab of points at each station. A point is only kept in the cross-section if its along-road distance falls within a strictly defined thickness threshold:
+\[
+    |u| \le \text{half\_thick\_u}.
+\]
+
+The algorithm also restricts the lateral coordinate to a configured search range:
+\[
+    v_{\min} \le v \le v_{\max}.
+\]
+
+Together, these two filters define a local corridor slice:
+\[
+    |u| \le \text{half\_thick\_u}
+    \quad \text{and} \quad
+    v_{\min} \le v \le v_{\max}.
+\]
+
+The local coordinate system makes the problem much simpler: instead of reasoning about arbitrary 3D point cloud geometry, the pipeline reduces each station to a lateral elevation profile across the road.
+
+\vspace{1em}
+\noindent\fbox{
+    \begin{minipage}{0.95\textwidth}
+    \textbf{Numerical Example 1: Cross-Section Slab} \\
+    If the pipeline configuration sets $\text{half\_thick\_u} = 0.4$ meters, the algorithm collects all points up to 0.4 meters ahead of the station anchor and 0.4 meters behind it. This creates a focused cross-sectional slice that is:
+    \[
+        2 \times 0.4 = 0.8 \text{ meters thick.}
+    \]
+    If the lateral limits are $v_{\min}=-15$ m and $v_{\max}=15$ m, then the algorithm considers a 30 meter wide corridor centered on the trajectory.
+    \end{minipage}
+}
+\vspace{1em}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.9\linewidth]{figure2.png}
+\caption{Single-station cross-section showing lane and sidewalk elevations $z$ as a function of lateral distance $v$, with $v=0$ marking the trajectory anchor.}
+\end{figure}
+
+\subsection{Cross-Section Orientation and Physical Side Recovery}
+After extracting the raw cross-section, the pipeline applies a simple orientation step. This step is not meant to change the physical meaning of the road sides. Instead, it makes the local cross-section easier to inspect and plot consistently.
+
+The raw lateral coordinate $v_{\text{raw}}$ depends on the trajectory direction. Depending on how the trajectory was recorded, the lane points may appear mostly on positive $v$ or mostly on negative $v$. For visualization and downstream bookkeeping, the notebook orients the cross-section so that the lane points sit on the positive-$v$ side.
+
+This is done by checking the median lateral position of the lane points:
+\[
+    \text{near\_sign} =
+    \begin{cases}
+    1, & \text{if median}(v_{\text{lane, raw}}) \ge 0 \\
+    -1, & \text{if median}(v_{\text{lane, raw}}) < 0.
+    \end{cases}
+\]
+
+The oriented coordinates are then:
+\[
+    v_{\text{lane}} = \text{near\_sign} \cdot v_{\text{lane, raw}},
+\]
+\[
+    v_{\text{sidewalk}} = \text{near\_sign} \cdot v_{\text{sidewalk, raw}}.
+\]
+
+If $\text{near\_sign}=1$, no flip is applied. If $\text{near\_sign}=-1$, both lane and sidewalk lateral coordinates are multiplied by $-1$. This makes the full cross-section plot consistent: the lane appears on the positive-$v$ side.
+
+Importantly, this orientation step does not decide the final physical side labels. The pipeline separately computes masks for physical \textbf{RIGHT} and physical \textbf{LEFT}. When no flip is applied:
+\[
+    \text{RIGHT}: v \ge 0,
+    \qquad
+    \text{LEFT}: v \le 0.
+\]
+When a flip is applied:
+\[
+    \text{RIGHT}: v \le 0,
+    \qquad
+    \text{LEFT}: v \ge 0.
+\]
+
+Thus, the oriented coordinate system is mainly a convenient internal representation for plotting and consistent cross-section handling. The final classification still happens separately for the physical right and physical left station-sides.
+
+\subsubsection{Relevant Code}
+This logic is handled mainly by:
+
+\begin{itemize}
+    \item \texttt{orient\_cross\_section}: flips $v$ only if needed so the lane appears on positive $v$.
+    \item \texttt{get\_physical\_side\_masks}: converts the oriented coordinates back into physical \textbf{RIGHT} and \textbf{LEFT} masks.
+\end{itemize}
+
+Conceptually, the orientation logic is:
+
+\begin{verbatim}
+if median(v_lane_raw) >= 0:
+    near_sign = 1
+else:
+    near_sign = -1
+
+v_lane_oriented = v_lane_raw * near_sign
+v_side_oriented = v_side_raw * near_sign
+
+if near_sign >= 0:
+    RIGHT = v >= 0
+    LEFT  = v <= 0
+else:
+    RIGHT = v <= 0
+    LEFT  = v >= 0
+\end{verbatim}
+
+\subsection{Relevant Code}
+The coordinate-system and corridor-sampling logic is mainly handled by the following functions in \texttt{updated\_ditch\_pipeline.py}:
+
+\begin{itemize}
+    \item \texttt{build\_station\_ruler}: converts the ordered trajectory points into cumulative station distance $s$.
+    \item \texttt{build\_trajectory\_splines}: builds smooth spline functions $x(s)$ and $y(s)$ for evaluating the trajectory at arbitrary station positions.
+    \item \texttt{compute\_heading}: computes the local tangent direction $\hat{t}$ at each station.
+    \item \texttt{extract\_cross\_section}: projects nearby points into local $(u,v)$ coordinates and keeps only points inside the cross-section slab.
+    \item \texttt{orient\_cross\_section}: flips the lateral coordinate when needed so the lane appears on positive $v$ for consistent plotting and bookkeeping.
+    \item \texttt{get\_physical\_side\_masks}: converts the internally oriented lateral coordinates back into physical \textbf{RIGHT} and \textbf{LEFT} station-side masks.
+    \item \texttt{build\_corridor\_results}: loops over stations and applies the extraction process to lane and sidewalk points.
+\end{itemize}
+
+The core projection step is implemented conceptually as:
+
+\begin{verbatim}
+rel = xy_pts - p
+u = rel @ t_hat
+n_hat = [t_hat_y, -t_hat_x]
+v = rel @ n_hat
+
+keep points where:
+    abs(u) <= half_thick_u
+    v_min <= v <= v_max
+\end{verbatim}
+
+The station loop is conceptually:
+
+\begin{verbatim}
+for each station s:
+    p = trajectory position at s
+    t_hat = local heading at s
+    lane_v, lane_z = extract_cross_section(lane points)
+    sidewalk_v, sidewalk_z = extract_cross_section(sidewalk points)
+    orient cross-section
+    split into RIGHT and LEFT station-sides
+\end{verbatim}
+
+\subsection{Cubic Spline Representation of the Trajectory}
+The original GPS trajectory is usually stored as a finite list of measured points. These points may be spaced irregularly, and they may be too sparse for dense corridor sampling. For example, the original GPS points may be several meters apart, while the pipeline may need to extract cross-sections every $0.2$ m. To support this denser station spacing, the pipeline fits cubic spline functions to the trajectory.
+
+The trajectory is first converted into a station parameter $s$, which measures cumulative distance along the input trajectory. Then two spline functions are built:
+\[
+    x = x(s),
+    \qquad
+    y = y(s).
+\]
+
+Together, these define a continuous trajectory curve:
+\[
+    \mathbf{p}(s) = \left(x(s), y(s)\right).
+\]
+
+This is important because it lets the pipeline evaluate the road position at arbitrary station values, not only at the original GPS samples. If the corridor loop uses:
+\[
+    \text{STEP\_SIZE} = 0.2 \text{ m},
+\]
+then the pipeline can generate station anchors at:
+\[
+    0.0,\ 0.2,\ 0.4,\ 0.6,\ \dots
+\]
+even if the raw GPS points were much farther apart.
+
+The spline also provides a smooth way to estimate the local heading. The derivative of the spline gives the local direction of travel:
+\[
+    \mathbf{d}(s)
+    =
+    \left(
+        \frac{dx}{ds},
+        \frac{dy}{ds}
+    \right).
+\]
+
+The unit tangent vector is then:
+\[
+    \hat{t}(s)
+    =
+    \frac{\mathbf{d}(s)}{\|\mathbf{d}(s)\|}.
+\]
+
+The right-facing normal vector is computed from the tangent as:
+\[
+    \hat{n}(s)
+    =
+    \left(
+        \hat{t}_y,
+        -\hat{t}_x
+    \right).
+\]
+
+Thus, cubic splines serve two related purposes:
+\begin{itemize}
+    \item they densify the usable trajectory so cross-sections can be sampled at a small step size such as $0.2$ m;
+    \item they provide smooth station positions and headings for stable cross-section extraction.
+\end{itemize}
+
+\subsubsection{Relevant Code}
+The spline construction is handled by \texttt{build\_trajectory\_splines}:
+
+\begin{verbatim}
+def build_trajectory_splines(s, traj_xy, min_ds=1e-9):
+    keep = np.ones(len(s), dtype=bool)
+    if len(s) >= 2:
+        keep[1:] = np.diff(s) > float(min_ds)
+
+    s_spline = s[keep]
+    xy_spline = traj_xy[keep]
+
+    return (
+        CubicSpline(s_spline, xy_spline[:, 0]),
+        CubicSpline(s_spline, xy_spline[:, 1]),
+        dropped,
+    )
+\end{verbatim}
+
+The heading computation can then use spline derivatives:
+
+\begin{verbatim}
+deriv = np.array([
+    float(cs_x(s_target, 1)),
+    float(cs_y(s_target, 1)),
+])
+t_hat = deriv / np.linalg.norm(deriv)
+\end{verbatim}
+
+If spline mode is enabled, the station anchor is evaluated as:
+\begin{verbatim}
+p = np.array([float(cs_x(s_target)), float(cs_y(s_target))])
+\end{verbatim}
+
+\section{Trajectory Refinement by Lane-Centre Alignment}
+
+\subsection{Why Refinement Is Needed}
+Raw GPS trajectories are rarely perfectly centered on the lane. A vehicle may drift within its lane while collecting data, and the GPS/trajectory estimate itself may have small lateral errors. If the raw trajectory is treated as the centerline of the corridor, then the local coordinate origin $v=0$ may be offset from the actual road center. This can skew cross-sections by placing too much lane on one side and too little on the other.
+
+To reduce this problem, the pipeline optionally refines the trajectory by estimating the lateral offset between the raw trajectory and the center of the lane point cloud. The corrected trajectory is then used as the station anchor for later cross-section extraction.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.95\linewidth]{figure3.png}
+\caption{Trajectory refinement diagnostic showing the original GPS trajectory, the corrected lane-centred trajectory, and the raw versus smoothed lateral lane-centre offset along station distance.}
+\label{fig:trajectory_refinement_lane_offset}
+\end{figure}
+
+Conceptually, the goal is to replace the raw station anchor
+\[
+    \mathbf{p}(s)
+\]
+with a corrected anchor
+\[
+    \mathbf{p}_{\text{corr}}(s),
+\]
+where the corrected anchor is shifted laterally toward the lane center.
+
+\subsection{Estimating Lane-Centre Offset}
+The algorithm estimates this correction by sampling the corridor at coarse station intervals. At each refinement station $s_i$, it extracts a lane-only cross-section and examines the lateral coordinates of the lane points.
+
+Let the lateral lane coordinates at station $s_i$ be:
+\[
+    \{v_1, v_2, \dots, v_N\}.
+\]
+
+Instead of using the minimum and maximum lateral values directly, the pipeline uses percentiles. This is more robust because isolated outlier points can occur from noise, nearby objects, or sparse returns. The estimated lane center is computed as:
+\[
+    v_{\text{center}}(s_i)
+    =
+    \frac{
+        P_5(v_{\text{lane}}) + P_{95}(v_{\text{lane}})
+    }{2},
+\]
+where $P_5$ is the 5th percentile and $P_{95}$ is the 95th percentile of the lane lateral coordinates.
+
+The value $v_{\text{center}}(s_i)$ is interpreted as the raw lateral offset between the current trajectory anchor and the estimated lane center:
+\[
+    \Delta v_{\text{raw}}(s_i) = v_{\text{center}}(s_i).
+\]
+
+If this offset is unreasonably large, the station is skipped:
+\[
+    |\Delta v_{\text{raw}}(s_i)| > \Delta v_{\max}.
+\]
+
+This prevents a bad lane slice, intersection flare, or unrelated point cluster from creating an unrealistic trajectory correction.
+
+\subsubsection{Relevant Code}
+In \texttt{updated\_ditch\_pipeline.py}, this logic is implemented inside \texttt{refine\_trajectory}:
+
+\begin{verbatim}
+refine_stations = np.arange(0.0, data.s[-1], config.refine_step)
+
+for s_target in refine_stations:
+    idx = int(np.argmin(np.abs(data.s - s_target)))
+
+    if config.use_spline:
+        p_ref = np.array([
+            float(data.cs_x(s_target)),
+            float(data.cs_y(s_target))
+        ])
+        heading_cs_x, heading_cs_y = data.cs_x, data.cs_y
+    else:
+        p_ref = data.traj_xy[idx]
+        heading_cs_x = heading_cs_y = None
+
+    t_ref = compute_heading(
+        data.traj_xy,
+        data.s,
+        idx,
+        config.heading_window,
+        float(s_target),
+        heading_cs_x,
+        heading_cs_y,
+    )
+
+    if t_ref is None:
+        continue
+
+    v_lane_ref, _ = extract_cross_section(
+        data.lane_xy,
+        data.lane_z,
+        data.lane_tree,
+        p_ref,
+        t_ref,
+        config.half_thick_u,
+        config.v_min,
+        config.v_max,
+        config.query_radius,
+    )
+
+    if len(v_lane_ref) < config.refine_min_lane_pts:
+        continue
+
+    lane_centre_v = 0.5 * (
+        float(np.percentile(v_lane_ref, 5)) +
+        float(np.percentile(v_lane_ref, 95))
+    )
+
+    if abs(lane_centre_v) > config.refine_max_offset:
+        continue
+
+    s_offsets.append(float(s_target))
+    raw_offsets.append(lane_centre_v)
+\end{verbatim}
+
+The key line is:
+\begin{verbatim}
+lane_centre_v = 0.5 * (P5 + P95)
+\end{verbatim}
+
+This creates a sequence of raw lateral offsets:
+\[
+    \left\{
+        (s_1, \Delta v_{\text{raw}}(s_1)),
+        (s_2, \Delta v_{\text{raw}}(s_2)),
+        \dots,
+        (s_m, \Delta v_{\text{raw}}(s_m))
+    \right\}.
+\]
+
+\subsection{Smoothing the Offset Curve}
+The raw offset estimates are computed from local point clouds, so they can be noisy. A single station may contain sparse lane points, extra points from an intersection, or local geometry that does not represent the normal road center. If the trajectory were shifted by these raw offsets directly, the corrected trajectory could become jagged.
+
+To avoid this, the pipeline smooths the offset sequence using a Savitzky-Golay filter. If the raw offset sequence is:
+\[
+    \Delta v_{\text{raw}}(s_i),
+\]
+the smoothed offset is:
+\[
+    \Delta v_{\text{smooth}}(s_i)
+    =
+    \operatorname{SG}\left(
+        \Delta v_{\text{raw}}(s_i)
+    \right),
+\]
+where $\operatorname{SG}(\cdot)$ denotes Savitzky-Golay smoothing.
+
+The purpose of this smoothing step is not to change the general correction direction, but to remove small station-to-station jumps.
+
+\subsubsection{Relevant Code}
+\begin{verbatim}
+sg_win = config.refine_sg_win
+
+if sg_win >= len(raw_offsets_arr):
+    sg_win = (
+        len(raw_offsets_arr) - 1
+        if (len(raw_offsets_arr) - 1) % 2 == 1
+        else len(raw_offsets_arr) - 2
+    )
+
+if sg_win < 5:
+    smooth_offsets = raw_offsets_arr
+else:
+    smooth_offsets = savgol_filter(
+        raw_offsets_arr,
+        window_length=sg_win,
+        polyorder=config.refine_sg_poly,
+    )
+\end{verbatim}
+
+The smoothing window is automatically reduced if there are not enough valid offset stations. If too few offset estimates exist, the pipeline skips smoothing and uses the raw offsets directly.
+
+\subsection{Building the Corrected Trajectory}
+Once the smoothed lateral offsets are available, the pipeline shifts each sampled trajectory point sideways along the local normal direction.
+
+At a refinement station $s_i$, let:
+\[
+    \mathbf{p}(s_i)
+\]
+be the raw trajectory point, and let:
+\[
+    \hat{n}(s_i)
+\]
+be the local right-facing normal vector. The corrected point is:
+\[
+    \mathbf{p}_{\text{corr}}(s_i)
+    =
+    \mathbf{p}(s_i)
+    +
+    \Delta v_{\text{smooth}}(s_i)\hat{n}(s_i).
+\]
+
+This equation means:
+\begin{itemize}
+    \item if $\Delta v_{\text{smooth}}(s_i)$ is positive, the point shifts in the positive normal direction;
+    \item if $\Delta v_{\text{smooth}}(s_i)$ is negative, the point shifts in the opposite direction;
+    \item if the offset is near zero, the point remains close to the original trajectory.
+\end{itemize}
+
+After computing these corrected points, the pipeline fits new cubic splines through them:
+\[
+    x_{\text{corr}}(s), \qquad y_{\text{corr}}(s).
+\]
+
+Importantly, the corrected spline is still parameterized by the original station coordinate $s$. The pipeline does not recompute station distances after shifting the trajectory. This keeps all downstream measurements synchronized with the original corridor stationing.
+
+\subsubsection{Relevant Code}
+\begin{verbatim}
+x_corr = np.zeros(len(s_offsets_arr), dtype=float)
+y_corr = np.zeros(len(s_offsets_arr), dtype=float)
+
+for i, (s_t, offset) in enumerate(zip(s_offsets_arr, smooth_offsets)):
+    if config.use_spline:
+        px = float(data.cs_x(s_t))
+        py = float(data.cs_y(s_t))
+        heading_cs_x, heading_cs_y = data.cs_x, data.cs_y
+    else:
+        idx_i = int(np.argmin(np.abs(data.s - s_t)))
+        px, py = data.traj_xy[idx_i]
+        heading_cs_x = heading_cs_y = None
+
+    idx_i = int(np.argmin(np.abs(data.s - s_t)))
+    t_i = compute_heading(
+        data.traj_xy,
+        data.s,
+        idx_i,
+        config.heading_window,
+        float(s_t),
+        heading_cs_x,
+        heading_cs_y,
+    )
+
+    if t_i is None:
+        x_corr[i] = px
+        y_corr[i] = py
+        continue
+
+    n_i = np.array([t_i[1], -t_i[0]])
+
+    x_corr[i] = px + offset * n_i[0]
+    y_corr[i] = py + offset * n_i[1]
+
+traj_corr = np.column_stack([x_corr, y_corr])
+cs_x_corr, cs_y_corr, dropped = build_trajectory_splines(
+    s_offsets_arr,
+    traj_corr,
+)
+\end{verbatim}
+
+The central correction equation appears in code as:
+\begin{verbatim}
+x_corr[i] = px + offset * n_i[0]
+y_corr[i] = py + offset * n_i[1]
+\end{verbatim}
+
+which corresponds to:
+\[
+    \mathbf{p}_{\text{corr}}(s_i)
+    =
+    \mathbf{p}(s_i)
+    +
+    \Delta v_{\text{smooth}}(s_i)\hat{n}(s_i).
+\]
+
+\subsection{How the Corrected Trajectory Is Used}
+During the final corridor extraction loop, the pipeline checks whether a corrected trajectory is available and whether the current station lies inside the valid correction range.
+
+If the corrected splines are valid at the current station, the pipeline uses:
+\[
+    \mathbf{p}_{\text{corr}}(s)
+    =
+    \left(
+        x_{\text{corr}}(s),
+        y_{\text{corr}}(s)
+    \right).
+\]
+
+If the station lies outside the corrected range, the pipeline falls back to the original trajectory spline:
+\[
+    \mathbf{p}(s)
+    =
+    \left(
+        x(s),
+        y(s)
+    \right).
+\]
+
+This fallback is important near the beginning and end of a segment. The refinement process may not have enough valid lane points near segment boundaries, and cubic splines can behave poorly if forced to extrapolate. By falling back to the original trajectory outside the valid correction range, the pipeline avoids unstable geometry at the segment edges.
+
+\subsubsection{Relevant Code}
+In \texttt{build\_corridor\_results}, the selected trajectory source is chosen as follows:
+
+\begin{verbatim}
+use_corr = bool(
+    refined.enabled
+    and refined.cs_x_corr is not None
+    and refined.cs_y_corr is not None
+    and refined.s_offsets is not None
+    and len(refined.s_offsets) >= 2
+)
+
+s_corr_min = float(np.min(refined.s_offsets)) if use_corr else np.nan
+s_corr_max = float(np.max(refined.s_offsets)) if use_corr else np.nan
+
+for s_target in stations:
+    idx = int(np.argmin(np.abs(data.s - s_target)))
+
+    if use_corr and s_corr_min <= float(s_target) <= s_corr_max:
+        p = np.array([
+            float(refined.cs_x_corr(s_target)),
+            float(refined.cs_y_corr(s_target))
+        ])
+        heading_cs_x, heading_cs_y = refined.cs_x_corr, refined.cs_y_corr
+        geom_source = "corr_spline"
+
+    elif config.use_spline:
+        p = np.array([
+            float(data.cs_x(s_target)),
+            float(data.cs_y(s_target))
+        ])
+        heading_cs_x, heading_cs_y = data.cs_x, data.cs_y
+        geom_source = "orig_spline"
+
+    else:
+        p = data.traj_xy[idx]
+        heading_cs_x = heading_cs_y = None
+        geom_source = "raw_traj"
+\end{verbatim}
+
+The variable \texttt{geom\_source} records which geometry was used:
+\begin{itemize}
+    \item \texttt{corr\_spline}: corrected lane-centred trajectory;
+    \item \texttt{orig\_spline}: original trajectory spline;
+    \item \texttt{raw\_traj}: raw trajectory point without spline evaluation.
+\end{itemize}
+
+\subsection{Numerical Example}
+Suppose that at station $s=50$ m, the lane-only cross-section has:
+\[
+    P_5(v_{\text{lane}}) = -1.8 \text{ m},
+    \qquad
+    P_{95}(v_{\text{lane}}) = 2.2 \text{ m}.
+\]
+
+The estimated lane center is:
+\[
+    v_{\text{center}}
+    =
+    \frac{-1.8 + 2.2}{2}
+    =
+    0.2 \text{ m}.
+\]
+
+This means the raw trajectory is approximately $0.2$ m away from the lane center in the local lateral direction. If smoothing keeps this correction near $0.2$ m, and the local normal vector is:
+\[
+    \hat{n} = (0.6, -0.8),
+\]
+then the corrected point is shifted by:
+\[
+    0.2 \hat{n}
+    =
+    (0.12, -0.16).
+\]
+
+If the original station anchor is:
+\[
+    \mathbf{p}(50) = (100.0, 200.0),
+\]
+then the corrected anchor becomes:
+\[
+    \mathbf{p}_{\text{corr}}(50)
+    =
+    (100.0, 200.0) + (0.12, -0.16)
+    =
+    (100.12, 199.84).
+\]
+
+This corrected point is then used as the station anchor for extracting the final lane and sidewalk cross-sections.
+
+\section{Corridor Sampling and Cross-Section Extraction}
+
+\subsection{Dense Station Sampling}
+After the trajectory has been represented as a continuous curve, and optionally refined toward the lane centre, the pipeline walks along the corridor at regular station intervals. These stations are sampled as:
+\[
+    s_k = k\Delta s,
+    \qquad
+    k = 0, 1, 2, \dots
+\]
+where
+\[
+    \Delta s = \text{STEP\_SIZE}.
+\]
+
+In the current pipeline, a typical value is:
+\[
+    \Delta s = 0.2 \text{ m}.
+\]
+
+This dense sampling is one of the main reasons cubic splines are useful. The original GPS trajectory may only contain points every few meters, but the spline can be evaluated at arbitrary station values. Therefore, the pipeline can create a much denser set of cross-section anchors than the raw GPS samples alone would allow.
+
+For example, if a segment is 100 m long and the step size is 0.2 m, the corridor loop evaluates approximately:
+\[
+    \frac{100}{0.2} = 500
+\]
+stations. Each station becomes a local geometric inspection point.
+
+\subsection{Choosing the Trajectory Geometry}
+At every station, the pipeline decides which trajectory geometry should define the station anchor and heading. It uses a fallback order:
+
+\begin{enumerate}
+    \item \textbf{Corrected spline}: used when lane-centre trajectory refinement succeeded and the station lies inside the valid corrected range.
+    \item \textbf{Original spline}: used when the corrected spline is unavailable or the station is outside the corrected range.
+    \item \textbf{Raw trajectory}: used only when spline evaluation is disabled.
+\end{enumerate}
+
+This can be written as:
+\[
+    \mathbf{p}_k =
+    \begin{cases}
+    \mathbf{p}_{\text{corr}}(s_k), & \text{if corrected spline is valid at } s_k, \\
+    \mathbf{p}(s_k), & \text{if the original spline is used}, \\
+    \mathbf{p}_{\text{raw},i}, & \text{if spline mode is disabled}.
+    \end{cases}
+\]
+
+The pipeline also records this choice in a field called \texttt{traj\_source}. This makes later debugging easier because each station can be traced back to the geometry source used to extract its cross-section.
+
+\subsection{Extracting the Local Cross-Section Slab}
+Once the trajectory geometry is selected, the pipeline computes the station-local coordinate frame:
+\[
+    \mathbf{p}(s_k),
+    \qquad
+    \hat{t}(s_k),
+    \qquad
+    \hat{n}(s_k).
+\]
+
+Each nearby point cloud point $\mathbf{q}$ is projected into this local frame:
+\begin{align}
+    u &= (\mathbf{q} - \mathbf{p}) \cdot \hat{t}, \\
+    v &= (\mathbf{q} - \mathbf{p}) \cdot \hat{n}.
+\end{align}
+
+The point is kept only if it lies inside the thin cross-section slab:
+\[
+    |u| \le \text{half\_thick\_u},
+\]
+and inside the lateral corridor window:
+\[
+    v_{\min} \le v \le v_{\max}.
+\]
+
+This extraction is performed twice at each station:
+\begin{itemize}
+    \item once for the lane/road point cloud;
+    \item once for the sidewalk point cloud.
+\end{itemize}
+
+The outputs are two lateral elevation point sets:
+\[
+    (v_{\text{lane}}, z_{\text{lane}}),
+    \qquad
+    (v_{\text{side}}, z_{\text{side}}).
+\]
+
+\subsection{Physical Right and Left Station-Sides}
+After extraction, the cross-section is internally oriented for consistent plotting and bookkeeping, as described earlier. The important point for classification is that the pipeline then computes physical \textbf{RIGHT} and \textbf{LEFT} masks.
+
+Let the physical-side masks be:
+\[
+    m^R_{\text{lane}}, \quad m^R_{\text{side}}, \quad
+    m^L_{\text{lane}}, \quad m^L_{\text{side}}.
+\]
+
+These masks split the lane and sidewalk points into physical station-sides:
+\[
+    v^R_{\text{lane}} = v_{\text{lane}}[m^R_{\text{lane}}],
+    \qquad
+    v^R_{\text{side}} = v_{\text{side}}[m^R_{\text{side}}],
+\]
+and
+\[
+    v^L_{\text{lane}} = v_{\text{lane}}[m^L_{\text{lane}}],
+    \qquad
+    v^L_{\text{side}} = v_{\text{side}}[m^L_{\text{side}}].
+\]
+
+The rule-based classifier later receives these right-side and left-side arrays separately. This is why one road station can produce two different classifications: one for physical \textbf{RIGHT}, and one for physical \textbf{LEFT}.
+
+\subsection{Storing Station Results}
+For each sampled station, the pipeline stores the extracted geometry in a structured dictionary. The important fields are:
+
+\begin{itemize}
+    \item \texttt{s}: station distance;
+    \item \texttt{traj\_source}: whether the station used corrected spline, original spline, or raw trajectory geometry;
+    \item \texttt{p}: station anchor point;
+    \item \texttt{t\_hat}: local tangent vector;
+    \item \texttt{n\_hat}: local normal vector;
+    \item \texttt{near\_sign}: orientation sign used for plotting/bookkeeping;
+    \item \texttt{v\_lane}, \texttt{z\_lane}: lane cross-section points;
+    \item \texttt{v\_side}, \texttt{z\_side}: sidewalk cross-section points;
+    \item \texttt{ml\_R}, \texttt{ms\_R}: lane and sidewalk masks for physical right;
+    \item \texttt{ml\_L}, \texttt{ms\_L}: lane and sidewalk masks for physical left.
+\end{itemize}
+
+All station dictionaries are appended to the list \texttt{results}. This list is the direct input to the rule-based classifier in the next stage.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.9\linewidth]{figure4.png}
+\caption{Corridor-wide view of extracted cross-sections. Each horizontal station slice contributes lane and sidewalk points in lateral coordinate $v$, producing a dense station-by-station representation of the road corridor.}
+\label{fig:corridor_map_v_vs_s}
+\end{figure}
+
+\subsection{Relevant Code}
+The full corridor loop is implemented by \texttt{build\_corridor\_results}. Conceptually, it follows this structure:
+
+\begin{verbatim}
+stations = np.arange(0.0, data.s[-1], config.step_size)
+
+for s_target in stations:
+    choose corrected spline, original spline, or raw trajectory
+    compute p and t_hat
+    compute n_hat
+
+    v_lane_raw, z_lane = extract_cross_section(...)
+    v_side_raw, z_side = extract_cross_section(...)
+
+    v_lane, v_side, near_sign = orient_cross_section(...)
+    ml_R, ms_R, ml_L, ms_L = get_physical_side_masks(...)
+
+    results.append({
+        "s": s_target,
+        "traj_source": geom_source,
+        "p": p,
+        "t_hat": t_hat,
+        "n_hat": n_hat,
+        "near_sign": near_sign,
+        "v_lane": v_lane,
+        "z_lane": z_lane,
+        "v_side": v_side,
+        "z_side": z_side,
+        "ml_R": ml_R,
+        "ms_R": ms_R,
+        "ml_L": ml_L,
+        "ms_L": ms_L,
+    })
+\end{verbatim}
+
+The main functions used here are:
+\begin{itemize}
+    \item \texttt{build\_corridor\_results}: orchestrates the dense station loop;
+    \item \texttt{extract\_cross\_section}: extracts lane or sidewalk points in a thin local slab;
+    \item \texttt{orient\_cross\_section}: orients the cross-section for consistent local representation;
+    \item \texttt{get\_physical\_side\_masks}: recovers physical \textbf{RIGHT} and \textbf{LEFT} masks.
+\end{itemize}
+
+\section{Rule-Based Station-Side Classification}
+
+\subsection{From Station Results to Station-Side Inputs}
+At the end of the previous stage, the pipeline has a list of station dictionaries stored in \texttt{results}. Each station contains the extracted lane and sidewalk cross-section points, along with masks that identify the physical \textbf{RIGHT} and physical \textbf{LEFT} sides of the road.
+
+For each station, the pipeline slices the lane and sidewalk arrays using the right-side masks:
+\[
+    v^R_{\text{lane}} = v_{\text{lane}}[m^R_{\text{lane}}],
+    \qquad
+    z^R_{\text{lane}} = z_{\text{lane}}[m^R_{\text{lane}}],
+\]
+\[
+    v^R_{\text{side}} = v_{\text{side}}[m^R_{\text{side}}],
+    \qquad
+    z^R_{\text{side}} = z_{\text{side}}[m^R_{\text{side}}].
+\]
+
+It does the same for the physical left side:
+\[
+    v^L_{\text{lane}} = v_{\text{lane}}[m^L_{\text{lane}}],
+    \qquad
+    z^L_{\text{lane}} = z_{\text{lane}}[m^L_{\text{lane}}],
+\]
+\[
+    v^L_{\text{side}} = v_{\text{side}}[m^L_{\text{side}}],
+    \qquad
+    z^L_{\text{side}} = z_{\text{side}}[m^L_{\text{side}}].
+\]
+
+Each side is then classified independently. From the classifier's perspective, it is only looking at one physical station-side at a time:
+\[
+    \texttt{classify\_side}
+    \left(
+        v_{\text{lane}},
+        z_{\text{lane}},
+        v_{\text{side}},
+        z_{\text{side}}
+    \right).
+\]
+
+This is important because the right and left sides of the same station can have different infrastructure. One side may contain a ramp while the other side may contain a curb, ditch, separated sidewalk, or no sidewalk.
+
+\subsubsection{Relevant Code}
+The unpacking of physical right and left station-sides happens inside \texttt{classify\_corridor\_results}:
+
+\begin{verbatim}
+for r in results:
+    vl = r["v_lane"]
+    zl = r["z_lane"]
+    vs = r["v_side"]
+    zs = r["z_side"]
+
+    ml_R, ms_R = r["ml_R"], r["ms_R"]
+    ml_L, ms_L = r["ml_L"], r["ms_L"]
+
+    vl_R, zl_R = vl[ml_R], zl[ml_R]
+    vs_R, zs_R = vs[ms_R], zs[ms_R]
+
+    vl_L, zl_L = vl[ml_L], zl[ml_L]
+    vs_L, zs_L = vs[ms_L], zs[ms_L]
+
+    res_R, dbg_R = classify_side(vl_R, zl_R, vs_R, zs_R)
+    res_L, dbg_L = classify_side(vl_L, zl_L, vs_L, zs_L)
+\end{verbatim}
+
+\subsection{Classification Decision Order}
+The classifier operates like a strict waterfall or decision tree. Before it spends computation on profile construction, derivatives, curvature, or shape analysis, it passes each station-side through a set of simple gates.
+
+If a station-side fails one of these early gates, it receives a class label immediately and the classifier exits. If it passes the gates, then the algorithm proceeds to more detailed shape analysis for curbs, ditches, and ramps.
+
+The main decision order is:
+
+\begin{enumerate}
+    \item too few sidewalk points $\rightarrow$ \textbf{NO\_SIDEWALK};
+    \item lane/sidewalk gap too large $\rightarrow$ \textbf{SEPARATED\_NO\_RAMP};
+    \item too few combined points or unstable profile $\rightarrow$ \textbf{UNKNOWN};
+    \item build the lateral elevation profile;
+    \item estimate interface and kink metrics;
+    \item evaluate curb and depressed-ditch candidates;
+    \item resolve curb-versus-ditch priority;
+    \item if neither curb nor ditch wins $\rightarrow$ \textbf{RAMP}.
+\end{enumerate}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=\textwidth]{figure5.png}
+\caption{Rule-based station-side classification decision tree. The classifier first applies fail-fast gates for missing sidewalk data, large lane-sidewalk separation, and unstable profiles, then evaluates curb and depressed-ditch candidates before assigning the final station-side class.}
+\label{fig:decision_tree}
+\end{figure}
+
+Conceptually, the classifier follows this structure:
+
+\begin{verbatim}
+if sidewalk point count < MIN_SW_PTS:
+    class = NO_SIDEWALK
+
+elif lane/sidewalk gap > GAP_MAX:
+    class = SEPARATED_NO_RAMP
+
+elif not enough combined points:
+    class = UNKNOWN
+
+elif profile cannot be built:
+    class = UNKNOWN
+
+else:
+    build lateral elevation profile
+    estimate interface geometry
+    compute kink metrics
+    evaluate curb candidate
+    evaluate ditch candidate
+    resolve curb-vs-ditch priority
+
+    if curb wins:
+        class = CURB_NO_RAMP
+    elif ditch wins:
+        class = DEPRESSED_DITCH
+    else:
+        class = RAMP
+\end{verbatim}
+
+\subsection{Gate 1: Sidewalk Existence}
+The first check asks whether there is enough sidewalk evidence on the current physical side. The classifier counts the sidewalk points:
+\[
+    N_{\text{side}} = \left|v_{\text{side}}\right|.
+\]
+
+If the sidewalk point count is below the minimum threshold,
+\[
+    N_{\text{side}} < N_{\min,\text{side}},
+\]
+then the station-side is classified as:
+\[
+    \textbf{NO\_SIDEWALK}.
+\]
+
+In the current pipeline, this threshold is controlled by \texttt{MIN\_SW\_PTS}. For example, if:
+\[
+    N_{\min,\text{side}} = 50
+\]
+and a station-side contains only 18 sidewalk points, the classifier does not attempt to infer a ramp, curb, or ditch. There is not enough sidewalk evidence, so the side is labeled \textbf{NO\_SIDEWALK}.
+
+\subsubsection{Relevant Code}
+\begin{verbatim}
+if len(v_side) < min_sw_pts:
+    return empty("NO_SIDEWALK")
+\end{verbatim}
+
+\subsection{Gate 2: Lane-Sidewalk Separation}
+If enough sidewalk points exist, the next question is whether the sidewalk is actually connected to the road. A sidewalk may exist, but it may be separated from the road by a grass strip, ditch, dirt median, or other large gap. In that case, the station-side is not treated as a normal ramp/curb transition.
+
+The algorithm estimates the facing edges of the lane and sidewalk using percentiles. Percentiles are used instead of exact minimum and maximum values because raw point clouds often contain outliers.
+
+For a right-side profile, the lane-facing lane edge is estimated as:
+\[
+    v_{\text{lane edge}} = P_{95}(v_{\text{lane}}),
+\]
+and the sidewalk-facing edge is estimated as:
+\[
+    v_{\text{side edge}} = P_5(v_{\text{side}}).
+\]
+
+For a left-side profile, the percentile directions are reversed:
+\[
+    v_{\text{lane edge}} = P_5(v_{\text{lane}}),
+\]
+\[
+    v_{\text{side edge}} = P_{95}(v_{\text{side}}).
+\]
+
+The lane-sidewalk gap is then:
+\[
+    g =
+    \left|
+        v_{\text{side edge}} - v_{\text{lane edge}}
+    \right|.
+\]
+
+If the gap is larger than the configured maximum,
+\[
+    g > g_{\max},
+\]
+then the side is classified as:
+\[
+    \textbf{SEPARATED\_NO\_RAMP}.
+\]
+
+\subsubsection{Numerical Example}
+Suppose the estimated lane-facing lane edge is:
+\[
+    v_{\text{lane edge}} = 3.2 \text{ m}
+\]
+and the sidewalk-facing edge is:
+\[
+    v_{\text{side edge}} = 5.1 \text{ m}.
+\]
+
+Then:
+\[
+    g = |5.1 - 3.2| = 1.9 \text{ m}.
+\]
+
+If:
+\[
+    g_{\max} = 1.5 \text{ m},
+\]
+then:
+\[
+    1.9 > 1.5,
+\]
+so the station-side is classified as \textbf{SEPARATED\_NO\_RAMP}.
+
+\subsubsection{Relevant Code}
+\begin{verbatim}
+gap = np.nan
+
+if len(v_lane) > 30 and len(v_side) > 30:
+    if on_right:
+        lane_edge = np.percentile(v_lane, 95)
+        sw_edge   = np.percentile(v_side, 5)
+    else:
+        lane_edge = np.percentile(v_lane, 5)
+        sw_edge   = np.percentile(v_side, 95)
+
+    gap = float(abs(sw_edge - lane_edge))
+
+    if gap > gap_max:
+        return empty("SEPARATED_NO_RAMP", gap)
+\end{verbatim}
+
+\subsection{Gate 3: Data Sufficiency}
+If the sidewalk exists and is close enough to the road, the classifier then checks whether there is enough total point support to build a reliable shape profile.
+
+The lane and sidewalk points are combined:
+\[
+    v_{\text{all}}
+    =
+    [v_{\text{lane}}, v_{\text{side}}],
+\]
+\[
+    z_{\text{all}}
+    =
+    [z_{\text{lane}}, z_{\text{side}}].
+\]
+
+The total number of points is:
+\[
+    N_{\text{all}} = |v_{\text{all}}|.
+\]
+
+If the total count is too small,
+\[
+    N_{\text{all}} < N_{\min,\text{all}},
+\]
+then the classifier returns:
+\[
+    \textbf{UNKNOWN}.
+\]
+
+Even if the raw point count is high enough, the side may still be labeled \textbf{UNKNOWN} if the binned elevation profile cannot be constructed reliably. This can happen when the points are too sparse, too unevenly distributed, or too noisy after binning.
+
+\subsubsection{Relevant Code}
+\begin{verbatim}
+v_all = np.concatenate([v_lane, v_side])
+z_all = np.concatenate([z_lane, z_side])
+
+if len(v_all) < UNKNOWN_MIN_ALL_PTS:
+    return empty("UNKNOWN", gap)
+
+prof = build_full_profile(v_all, z_all, bin_size, min_pts, sg_win, sg_poly)
+
+if prof is None:
+    return empty("UNKNOWN", gap)
+\end{verbatim}
+
+This is the bridge into the next stage of the algorithm: building a full lateral elevation profile from the combined lane and sidewalk points.
+
+\subsection{Classifier Outputs}
+If a station-side passes the first three gates, the classifier proceeds to calculate transition kinks, curb candidates, and depressed-ditch candidates. These detailed calculations are discussed in the following sections.
+
+For every station-side, the classifier returns two objects:
+\[
+    (\texttt{result}, \texttt{dbg})
+    =
+    \texttt{classify\_side}(\cdots).
+\]
+
+The first object, \texttt{result}, is the compact summary used by exports and later stages. It contains fields such as:
+
+\begin{itemize}
+    \item \texttt{class}: final class label;
+    \item \texttt{gap\_m}: lane-sidewalk gap;
+    \item \texttt{dz\_m}: transition height difference;
+    \item \texttt{slope}: transition slope;
+    \item \texttt{transition\_width\_m}: lateral width of the transition;
+    \item \texttt{kink1\_v}, \texttt{kink2\_v}: estimated kink locations;
+    \item \texttt{ambiguous}: flag indicating whether multiple class candidates were active.
+\end{itemize}
+
+The second object, \texttt{dbg}, is the detailed diagnostic payload. It contains richer internal arrays and metrics, such as:
+
+\begin{itemize}
+    \item binned profile coordinates;
+    \item smoothed elevation profile;
+    \item detrended profile;
+    \item derivative arrays;
+    \item kink bounds;
+    \item curb metrics;
+    \item depressed-ditch metrics.
+\end{itemize}
+
+Early-exit classes such as \textbf{NO\_SIDEWALK}, \textbf{SEPARATED\_NO\_RAMP}, and some \textbf{UNKNOWN} cases may return \texttt{dbg = None}, because the full profile was not needed.
+
+\subsection{Optional Sidewalk Cluster Logic}
+After classifying the physical right and left sides, the pipeline can also inspect the sidewalk points for disconnected clusters. Some station-sides may contain multiple sidewalk pieces, such as a main sidewalk plus a detached island or separate pedestrian surface.
+
+The helper \texttt{build\_sidewalk\_clusters} groups sidewalk points by lateral gaps. Meaningful detached clusters can be marked separately, and if cluster splitting is enabled, detached clusters can receive the label \textbf{SEPARATED\_NO\_RAMP}. This logic is auxiliary to the main station-side classifier, but it helps preserve information about disconnected sidewalk geometry.
+
+\subsection{Relevant Code}
+The main functions for this section are:
+
+\begin{itemize}
+    \item \texttt{classify\_corridor\_results}: loops over all station records and classifies physical right and left sides;
+    \item \texttt{classify\_side}: applies the gate logic and advanced rule-based classification to one physical station-side;
+    \item \texttt{build\_sidewalk\_clusters}: optionally identifies detached sidewalk clusters.
+\end{itemize}
+
+\section{Lateral Elevation Profile Construction}
+
+\subsection{Purpose of the Profile}
+Once a station-side passes the early classification gates, the pipeline has enough point support to analyze the local transition geometry. At this point, the raw lane and sidewalk points are still an irregular point cloud. They are not yet in a form where height steps, slopes, curvature, kinks, or valley shapes can be measured consistently.
+
+The purpose of the lateral elevation profile is to convert this scattered station-side data into a stable one-dimensional signal:
+\[
+    z = z(v),
+\]
+where $v$ is lateral distance across the station-side and $z$ is elevation. This profile is not only a visualization tool. It is the numerical object used by the later rule-based logic to locate transition bounds, estimate curb-like height changes, and detect depressed ditch geometry.
+
+The profile construction is handled by \texttt{build\_full\_profile}. If the profile cannot be built reliably, the station-side is classified as \textbf{UNKNOWN}, as described in the previous section.
+
+\subsection{Merging Lane and Sidewalk Points}
+For one physical station-side, the classifier receives separate lane and sidewalk arrays:
+\[
+    (v_{\text{lane}}, z_{\text{lane}}),
+    \qquad
+    (v_{\text{side}}, z_{\text{side}}).
+\]
+
+The first step is to merge them into a single lateral profile input:
+\[
+    v_{\text{all}}
+    =
+    [v_{\text{lane}}, v_{\text{side}}],
+\]
+\[
+    z_{\text{all}}
+    =
+    [z_{\text{lane}}, z_{\text{side}}].
+\]
+
+This creates one continuous station-side surface from the lane-facing region toward the sidewalk-facing region. The later classifier can then reason about the transition between the two surfaces using one common lateral coordinate system.
+
+\subsubsection{Relevant Code}
+\begin{verbatim}
+v_all = np.concatenate([v_lane, v_side])
+z_all = np.concatenate([z_lane, z_side])
+\end{verbatim}
+
+\subsection{Finite Filtering and Sorting}
+Before binning, the pipeline removes invalid coordinates and elevations. Only points with finite $v$ and finite $z$ are kept:
+\[
+    \text{valid}(i)
+    =
+    \operatorname{isfinite}(v_i)
+    \land
+    \operatorname{isfinite}(z_i).
+\]
+
+If too few valid points remain, the profile is rejected. In the current implementation, \texttt{build\_full\_profile} requires at least 20 finite merged points before continuing.
+
+After filtering, the points are sorted by lateral coordinate $v$. Sorting matters because interpolation and gradient calculations assume that the profile moves monotonically across the cross-section.
+
+\subsubsection{Relevant Code}
+\begin{verbatim}
+ok = np.isfinite(v_all) & np.isfinite(z_all)
+v_all = v_all[ok]
+z_all = z_all[ok]
+
+if len(v_all) < 20:
+    return None
+
+order = np.argsort(v_all)
+v_all = v_all[order]
+z_all = z_all[order]
+\end{verbatim}
+
+\subsection{Median Binning}
+Raw point clouds do not have uniform point spacing. Some lateral regions may contain many points, while others may contain only a few. To create a regular profile, the pipeline divides the lateral range into fixed-width bins. In the current configuration, the bin width is:
+\[
+    \Delta v_{\text{bin}} = 0.08 \text{ m}.
+\]
+
+For each bin, the algorithm collects all points whose lateral coordinates fall inside that bin. If the bin contains at least the configured minimum number of points, currently:
+\[
+    N_{\min,\text{bin}} = 3,
+\]
+then the bin elevation is set to the median of the elevations in that bin:
+\[
+    z_{\text{med},j}
+    =
+    \operatorname{median}\left(\{z_i : v_i \in \text{bin } j\}\right).
+\]
+
+Median binning has two purposes. First, it converts irregular point density into an evenly spaced lateral signal. Second, it reduces the influence of isolated elevation outliers, because a single unusually high or low point does not dominate the bin value.
+
+The output of this step is:
+\[
+    (v_{\text{ctr}}, z_{\text{med}}),
+\]
+where $v_{\text{ctr}}$ contains the center coordinate of each lateral bin, and $z_{\text{med}}$ contains the median elevation for that bin. Bins that do not have enough points are left as missing values.
+
+\subsubsection{Relevant Code}
+\begin{verbatim}
+edges = np.arange(float(np.min(v)), float(np.max(v)) + bin_size, bin_size)
+idx = np.digitize(v, edges) - 1
+v_ctr = (edges[:-1] + edges[1:]) * 0.5
+z_med = np.full(len(v_ctr), np.nan)
+
+for b in range(len(v_ctr)):
+    sel = idx == b
+    if np.sum(sel) >= min_pts:
+        z_med[b] = np.median(z[sel])
+\end{verbatim}
+
+\subsection{Sparse Profile Rejection}
+Interpolation is only useful when it fills small gaps inside an otherwise valid profile. It should not invent a profile from too little data. For that reason, the pipeline checks how many bins received valid median elevations:
+\[
+    N_{\text{valid bins}}
+    =
+    \left|\{j : z_{\text{med},j} \text{ is finite}\}\right|.
+\]
+
+If fewer than 12 bins are valid, \texttt{build\_full\_profile} returns \texttt{None}. The station-side then remains in the \textbf{UNKNOWN} path, because there is not enough lateral structure to support the later geometric measurements.
+
+\subsubsection{Relevant Code}
+\begin{verbatim}
+ok2 = np.isfinite(z_med)
+if np.sum(ok2) < 12:
+    return None
+\end{verbatim}
+
+\subsection{Interpolating Internal Gaps}
+After sparse profiles are rejected, the remaining missing bins are filled using linear interpolation. The interpolation uses the valid median-elevation bins as anchor points and fills missing values along the lateral coordinate axis.
+
+This step produces a complete elevation vector:
+\[
+    z_{\text{fill}}(v),
+\]
+which can be passed into smoothing and derivative calculations. The purpose is not to claim that the missing bins were directly observed. Instead, interpolation provides a continuous numerical profile when the missing regions are small enough for the profile to remain usable.
+
+\subsubsection{Relevant Code}
+\begin{verbatim}
+z_fill = z_med.copy()
+z_fill[~ok2] = np.interp(v_ctr[~ok2], v_ctr[ok2], z_fill[ok2])
+\end{verbatim}
+
+\subsection{Savitzky-Golay Smoothing}
+The filled profile is then smoothed with a Savitzky-Golay filter. This filter fits a local polynomial over a moving window and evaluates the smoothed value at each bin. In the current configuration, the smoothing parameters are:
+\[
+    \texttt{sg\_win} = 11,
+    \qquad
+    \texttt{sg\_poly} = 4.
+\]
+
+The purpose of this step is to create a stable curve for classification. Kink selection, slope estimates, and curvature estimates are sensitive to small bin-to-bin fluctuations. The smoothed profile reduces those small fluctuations while preserving the larger transition shape more appropriately than a simple moving average.
+
+Let the filled profile be $z_{\text{fill}}$. The smoothed profile is:
+\[
+    z_s = \operatorname{SG}(z_{\text{fill}}),
+\]
+where $\operatorname{SG}(\cdot)$ denotes Savitzky-Golay smoothing.
+
+\subsubsection{Relevant Code}
+\begin{verbatim}
+z_s = smooth_savgol(z_fill, config.sg_win, config.sg_poly)
+\end{verbatim}
+
+The smoothing helper also adjusts the window when the profile is short. If the window is too large or too small for the available data, the function either shrinks the window or returns the original array unchanged.
+
+\subsection{Linear Detrending}
+After smoothing, the pipeline removes a best-fit linear trend from the profile. Roads and sidewalks are not always level across the local cross-section. A station-side may include road crown, drainage grade, or general terrain slope. If this broad trend remains in the profile, it can obscure local depressed shapes.
+
+The pipeline fits a line:
+\[
+    z_{\text{trend}}(v) = av + b
+\]
+to the smoothed profile. It then subtracts this line:
+\[
+    z_{\text{dt}}(v)
+    =
+    z_s(v) - z_{\text{trend}}(v).
+\]
+
+The result is the detrended profile $z_{\text{dt}}$. This detrended representation is especially important for depressed-ditch detection, because the ditch logic is interested in local valley shape rather than the overall tilt of the station-side.
+
+\subsubsection{Relevant Code}
+\begin{verbatim}
+a, b = np.polyfit(v[ok], z[ok], 1)
+z_dt = z - (a * v + b)
+\end{verbatim}
+
+Inside \texttt{build\_full\_profile}, this appears as:
+\begin{verbatim}
+z_dt, trend = detrend_profile(v_ctr, z_s)
+\end{verbatim}
+
+\subsection{Derivatives for Shape Analysis}
+The pipeline computes derivatives after detrending. The stored first derivative is:
+\[
+    d_1(v)
+    \approx
+    \frac{d z_{\text{dt}}}{dv},
+\]
+and the stored second derivative is:
+\[
+    d_2(v)
+    \approx
+    \frac{d^2 z_{\text{dt}}}{dv^2}.
+\]
+
+The first derivative describes local slope in the detrended profile. The second derivative describes curvature. Positive curvature indicates a concave-up shape, which is one of the geometric cues used by the depressed-ditch detector.
+
+\subsubsection{Important Distinction}
+The derivative arrays stored in the profile dictionary, \texttt{d1} and \texttt{d2}, are computed from the detrended profile \texttt{z\_dt}. These derivatives are used by the depressed-ditch logic.
+
+Kink detection uses a separate derivative calculation. The helper \texttt{pick\_two\_kinks} recomputes first and second derivatives from the smoothed profile \texttt{z\_s}. This is because kink bounds are meant to describe the actual transition shape in the smoothed elevation profile, while ditch detection is meant to emphasize local valley shape after broad cross-slope has been removed.
+
+\subsubsection{Relevant Code}
+The profile-level derivatives are computed as:
+\begin{verbatim}
+d1 = np.gradient(z_dt, config.bin_size)
+d2 = np.gradient(d1, config.bin_size)
+\end{verbatim}
+
+The kink helper separately computes derivatives from \texttt{z\_s}:
+\begin{verbatim}
+d1 = np.gradient(z_s, bin_size)
+d2 = np.gradient(d1, bin_size)
+\end{verbatim}
+
+\subsection{Profile Output Package}
+If profile construction succeeds, \texttt{build\_full\_profile} returns a dictionary containing all profile representations needed by the downstream classifier:
+
+\begin{itemize}
+    \item \texttt{v\_ctr}: center coordinate of each lateral bin;
+    \item \texttt{z\_med}: median elevation per bin, with sparse bins left missing;
+    \item \texttt{z\_fill}: median profile after internal missing bins are interpolated;
+    \item \texttt{z\_s}: Savitzky-Golay smoothed elevation profile;
+    \item \texttt{z\_dt}: detrended profile after subtracting the best-fit line;
+    \item \texttt{d1}: first derivative of the detrended profile;
+    \item \texttt{d2}: second derivative of the detrended profile;
+    \item \texttt{trend\_coef}: coefficients of the fitted linear trend.
+\end{itemize}
+
+\subsubsection{Relevant Code}
+\begin{verbatim}
+return {
+    "v_ctr": v_ctr,
+    "z_med": z_med,
+    "z_fill": z_fill,
+    "z_s": z_s,
+    "z_dt": z_dt,
+    "d1": d1,
+    "d2": d2,
+    "trend_coef": trend,
+}
+\end{verbatim}
+
+This output package becomes the geometric foundation for the next stage of the classifier: estimating the lane-sidewalk interface, selecting kink bounds, evaluating curb candidates, and detecting depressed-ditch valley shape.
+
+\section{Interface, Kink, Curb, and Depressed-Ditch Metrics}
+
+\subsection{Purpose of the Metric Stage}
+After the lateral elevation profile is constructed, the classifier extracts a set of geometric measurements from the station-side. These measurements describe where the lane-sidewalk interface is located, where the main transition kinks occur, whether the transition is steep enough to be curb-like, and whether the detrended shape contains a depressed ditch.
+
+This stage is where the classifier moves from a profile representation to physical evidence. The important outputs are not only the final class label, but also quantities such as transition width, height difference, slope, valley depth, valley curvature, and ambiguity flags. These values are stored in the result and debug dictionaries so the decision can be audited later.
+
+\subsection{Lane-Sidewalk Interface Estimation}
+The first measurement is the lane-sidewalk interface. The interface is the lateral region where the lane-facing edge and sidewalk-facing edge approach each other. The classifier estimates this interface directly from the raw lane and sidewalk point arrays for the current physical side.
+
+The lateral edge positions are estimated with percentiles rather than exact minima or maxima. This is because the extreme points in a LiDAR cross-section can include sparse outliers, rough edges, or small disconnected returns.
+
+For a physical right-side profile, the lane-facing edge is estimated as:
+\[
+    v_{\text{lane edge}} = P_{95}(v_{\text{lane}}),
+\]
+and the sidewalk-facing edge is estimated as:
+\[
+    v_{\text{side edge}} = P_5(v_{\text{side}}).
+\]
+
+For a physical left-side profile, the percentile directions are reversed:
+\[
+    v_{\text{lane edge}} = P_5(v_{\text{lane}}),
+\]
+\[
+    v_{\text{side edge}} = P_{95}(v_{\text{side}}).
+\]
+
+The lateral gap between the two facing edges is:
+\[
+    g
+    =
+    \left|v_{\text{side edge}} - v_{\text{lane edge}}\right|.
+\]
+
+This is the same geometric idea used earlier in the lane-sidewalk separation gate. At this stage, however, the interface estimate is also used to center the later kink and ditch searches.
+
+\subsubsection{Relevant Code}
+\begin{verbatim}
+on_right = np.median(v_lane_side) >= 0
+
+if on_right:
+    lane_edge_v = float(np.percentile(v_lane_side, 95))
+    side_edge_v = float(np.percentile(v_side_side, 5))
+else:
+    lane_edge_v = float(np.percentile(v_lane_side, 5))
+    side_edge_v = float(np.percentile(v_side_side, 95))
+
+gap_m = float(abs(side_edge_v - lane_edge_v))
+\end{verbatim}
+
+\subsection{Edge-Band Elevation Metrics}
+After locating the lateral edge positions, the classifier measures representative elevations near those edges. It does this by taking a narrow lateral band around each edge. In the current configuration, the band width is:
+\[
+    \texttt{edge\_band} = 0.35 \text{ m}.
+\]
+
+The lane edge band is:
+\[
+    \left|v_{\text{lane}} - v_{\text{lane edge}}\right| \le 0.35,
+\]
+and the sidewalk edge band is:
+\[
+    \left|v_{\text{side}} - v_{\text{side edge}}\right| \le 0.35.
+\]
+
+The classifier then computes median elevations inside those bands:
+\[
+    z_{\text{lane edge} }
+    =
+    \operatorname{median}(z_{\text{lane band}}),
+\]
+\[
+    z_{\text{side edge} }
+    =
+    \operatorname{median}(z_{\text{side band}}).
+\]
+
+These median edge elevations are used to calculate an interface height step:
+\[
+    \Delta z_{\text{edge}}
+    =
+    z_{\text{side edge}} - z_{\text{lane edge}},
+\]
+and an interface edge slope:
+\[
+    m_{\text{edge}}
+    =
+    \frac{\left|\Delta z_{\text{edge}}\right|}{\max(g, 10^{-6})}.
+\]
+
+It is important to separate the two uses of the interface. The lateral edge positions are still important in the current classifier because they define the center of the kink-search window. The median edge elevations, \texttt{dz\_edge}, and \texttt{edge\_slope} are retained as diagnostic/interface metrics and support the alternate interface-based curb mode. However, the current default curb decision uses kink-derived height difference and slope instead of \texttt{dz\_edge} and \texttt{edge\_slope}.
+
+\subsubsection{Relevant Code}
+\begin{verbatim}
+lane_band = np.abs(v_lane_side - lane_edge_v) <= edge_band
+side_band = np.abs(v_side_side - side_edge_v) <= edge_band
+
+z_lane_edge = float(np.median(z_lane_side[lane_band]))
+z_side_edge = float(np.median(z_side_side[side_band]))
+
+dz_edge = float(z_side_edge - z_lane_edge)
+edge_slope = abs(dz_edge) / max(gap_m, 1e-6)
+\end{verbatim}
+
+\subsection{Interface Center and Kink Search Window}
+If the interface edge positions are available, the classifier defines an interface center:
+\[
+    v_{\text{center}}
+    =
+    \frac{
+        v_{\text{lane edge}} + v_{\text{side edge}}
+    }{2}.
+\]
+
+The kink search is then restricted to a local window around this center:
+\[
+    v_{\text{lo}}
+    =
+    v_{\text{center}} - 0.75,
+\]
+\[
+    v_{\text{hi}}
+    =
+    v_{\text{center}} + 0.75.
+\]
+
+This restriction is important because the classifier is trying to identify the kinks of the lane-sidewalk transition, not the largest curvature anywhere in the full station-side profile. If the full profile were used without restriction, the strongest curvature could come from a sidewalk defect, road crown, ditch feature, remote terrain shape, or a profile endpoint rather than from the actual transition interface.
+
+\subsubsection{Relevant Code}
+\begin{verbatim}
+interface_center_v = 0.5 * float(
+    interface["lane_edge_v"] + interface["side_edge_v"]
+)
+v_lo = interface_center_v - config.interface_kink_buffer
+v_hi = interface_center_v + config.interface_kink_buffer
+\end{verbatim}
+
+\subsection{Kink Selection}
+Kink selection is performed on the smoothed elevation profile \texttt{z\_s}. It does not use the detrended profile. The reason is that kink bounds are intended to describe the actual transition shape in elevation, while detrending is mainly used for valley analysis in ditch detection.
+
+The helper \texttt{pick\_two\_kinks} computes derivatives from \texttt{z\_s}:
+\[
+    d_1^s(v)
+    \approx
+    \frac{dz_s}{dv},
+\]
+\[
+    d_2^s(v)
+    \approx
+    \frac{d^2z_s}{dv^2}.
+\]
+
+Inside the interface-centered search window, the classifier finds the strongest positive and negative curvature extrema:
+\[
+    i_+ = \arg\max(d_2^s),
+\]
+\[
+    i_- = \arg\min(d_2^s).
+\]
+
+These two extrema become the candidate kink locations:
+\[
+    k_1 = v_{\text{ctr}}[i_+],
+    \qquad
+    k_2 = v_{\text{ctr}}[i_-].
+\]
+
+The two kinks are then sorted into a lower and upper lateral bound:
+\[
+    v_0 = \min(k_1, k_2),
+    \qquad
+    v_1 = \max(k_1, k_2).
+\]
+
+If the interface window is unavailable or too sparse, the function falls back to the full profile endpoints. This fallback keeps the classifier from failing outright, but the debug output records the fallback mode and note so the decision remains auditable.
+
+\subsubsection{Relevant Code}
+\begin{verbatim}
+d1 = np.gradient(z_s, bin_size)
+d2 = np.gradient(d1, bin_size)
+
+idx = np.where((v_ctr >= lo) & (v_ctr <= hi))[0]
+
+i_p = int(idx[np.argmax(d2[idx])])
+i_n = int(idx[np.argmin(d2[idx])])
+\end{verbatim}
+
+\subsection{Transition Width, Height Difference, and Slope}
+Once the two kink bounds are selected, the transition width is:
+\[
+    w = v_1 - v_0.
+\]
+
+The classifier then finds the profile-bin indices nearest to $v_0$ and $v_1$. Under the current default configuration, \texttt{use\_doc\_kink\_metrics = True}, so the transition height difference is measured from the smoothed profile:
+\[
+    \Delta z_{\text{kink}}
+    =
+    z_s(v_1) - z_s(v_0).
+\]
+
+The kink-derived slope is:
+\[
+    m_{\text{kink}}
+    =
+    \frac{\left|\Delta z_{\text{kink}}\right|}{\max(w, 10^{-9})}.
+\]
+
+If the transition width is too small, the selected kinks are not treated as a reliable physical feature. In the current classifier, if:
+\[
+    w \le 0.05 \text{ m},
+\]
+the station-side is returned as \textbf{UNKNOWN} with the note \texttt{no\_clear\_kinks}.
+
+\subsubsection{Relevant Code}
+\begin{verbatim}
+v0, v1 = sorted([kink1, kink2])
+width = float(v1 - v0)
+
+i0 = int(np.argmin(np.abs(v_ctr - v0)))
+i1 = int(np.argmin(np.abs(v_ctr - v1)))
+
+dz = float(z_s[i1] - z_s[i0])
+slope = abs(dz) / max(width, 1e-9)
+
+if width <= 0.05:
+    return UNKNOWN
+\end{verbatim}
+
+\subsection{Curb Candidate Logic}
+The pipeline keeps two curb-related measurements: interface-based curb evidence and kink-based curb evidence.
+
+The interface-based check uses the median edge-band measurements:
+\[
+    \left|\Delta z_{\text{edge}}\right| \ge h_{\min},
+\]
+\[
+    m_{\text{edge}} \ge m_{\min}.
+\]
+
+The kink-based check uses the smoothed kink-bound measurements:
+\[
+    \left|\Delta z_{\text{kink}}\right| \ge h_{\min},
+\]
+\[
+    m_{\text{kink}} \ge m_{\min}.
+\]
+
+In the current configuration:
+\[
+    h_{\min} = 0.05 \text{ m},
+\]
+\[
+    m_{\min} = 0.1.
+\]
+
+The current default classifier uses the kink-based curb decision because \texttt{use\_doc\_kink\_metrics = True}. Therefore, a station-side becomes a curb candidate when the transition between the selected kinks is both tall enough and steep enough. This separates a sharp curb-like step from a long, gradual ramp-like transition.
+
+\subsubsection{Relevant Code}
+\begin{verbatim}
+curb_from_interface = bool(curb_info.get("is_curb", False))
+curb_from_kink = bool(
+    abs(dz) >= config.curb_height_thresh
+    and slope >= config.curb_slope_thresh
+)
+
+is_curb = curb_from_kink if config.use_doc_kink_metrics else curb_from_interface
+\end{verbatim}
+
+\subsection{Depressed-Ditch Candidate Logic}
+Depressed-ditch detection uses the detrended profile \texttt{z\_dt} and the detrended derivatives \texttt{d1} and \texttt{d2}. This is different from kink selection, which uses the smoothed profile \texttt{z\_s}. The ditch detector uses the detrended representation because it is trying to detect a local valley shape after broad road crown or terrain slope has been removed.
+
+By default, ditch detection is restricted to a wider interface-centered buffer:
+\[
+    [v_{\text{center}} - 3.0,
+    \; v_{\text{center}} + 3.0].
+\]
+
+This restriction has the same general motivation as the kink window: the classifier should evaluate ditch geometry near the lane-sidewalk transition, not allow a distant low area or unrelated terrain depression to dominate the station-side decision.
+
+Inside the ditch window, the algorithm finds the minimum of the detrended profile:
+\[
+    i_{\min} = \arg\min(z_{\text{dt}}),
+\]
+\[
+    z_{\min} = z_{\text{dt}}[i_{\min}].
+\]
+
+It estimates left and right shoulder elevations using median values near the ends of the evaluated profile window:
+\[
+    z_L = \operatorname{median}(z_{\text{dt,left end}}),
+\]
+\[
+    z_R = \operatorname{median}(z_{\text{dt,right end}}).
+\]
+
+The ditch depth is limited by the lower of the two shoulders:
+\[
+    D_{\text{valley}}
+    =
+    \min(z_L - z_{\min},\; z_R - z_{\min}).
+\]
+
+This prevents a one-sided slope from being mistaken for a symmetric drainage depression. The detector also measures slope behavior around the minimum, curvature near the minimum, and ditch widths at two relative depth levels. The width checks help distinguish a plausible depressed channel from a tiny pothole or a broad terrain sag.
+
+In the current threshold logic, a depressed ditch candidate requires:
+\[
+    D_{\text{valley}} \ge 0.04 \text{ m},
+\]
+\[
+    \text{slope sign change is acceptable},
+\]
+\[
+    \text{valley curvature} > 0.5,
+\]
+\[
+    0.30 \le \text{valley width}_{50},
+\]
+\[
+    \text{valley width}_{30} \le 0.6.
+\]
+
+If all these conditions are met, \texttt{ditch\_found} is set to \texttt{True} and the geometric class is \textbf{DEPRESSED\_DITCH}.
+
+\subsubsection{Relevant Code}
+\begin{verbatim}
+v_use = prof["v_ctr"]
+z_use = prof["z_dt"]
+d1_use = prof["d1"]
+d2_use = prof["d2"]
+
+v_lo = float(v_center - config.ditch_buffer)
+v_hi = float(v_center + config.ditch_buffer)
+mask = (prof["v_ctr"] >= v_lo) & (prof["v_ctr"] <= v_hi)
+
+geom = summarize_profile_geometry(v_use, z_use, d1_use, d2_use)
+
+ditch_found = bool(
+    geom["valley_depth"] >= 0.04
+    and sign_ok
+    and geom["valley_curv"] > 0.5
+    and np.isfinite(width50)
+    and np.isfinite(width30)
+    and 0.30 <= width50
+    and width30 <= 0.6
+)
+\end{verbatim}
+
+\subsection{Curb-Ditch Priority Resolution}
+The classifier evaluates curb and ditch candidates before choosing the final class. This matters because the same station-side can sometimes activate both candidates. For example, a profile may contain a sharp edge near a depressed drainage shape, or a ditch-like profile may also produce a steep kink measurement.
+
+The output includes an ambiguity flag:
+\[
+    \texttt{ambiguous} = 1
+\]
+when both \texttt{is\_curb} and \texttt{is\_ditch} are true.
+
+In the current default configuration:
+\[
+    \texttt{ditch\_priority\_over\_curb} = \texttt{False}.
+\]
+
+Therefore, the default priority order is curb first, then depressed ditch, then ramp:
+\begin{verbatim}
+if is_curb:
+    class = CURB_NO_RAMP
+elif is_ditch:
+    class = DEPRESSED_DITCH
+else:
+    class = RAMP
+\end{verbatim}
+
+The code also supports an alternate heuristic where depressed ditch can be prioritized over curb. This is useful when the overall station-side shape should be treated as ditch-dominant even though curb-like measurements may also be present. In that mode, ditch wins unless the curb evidence is especially strong.
+
+The curb override condition is:
+\[
+    m_{\text{curb used}}
+    \ge
+    2.5 \cdot m_{\min}.
+\]
+
+With the current curb slope threshold:
+\[
+    m_{\min} = 0.1,
+\]
+the override threshold is:
+\[
+    2.5 \times 0.1 = 0.25.
+\]
+
+Thus, even if ditch-priority mode is enabled, a very strong curb-like slope can override the ditch-priority rule.
+
+\subsubsection{Relevant Code}
+\begin{verbatim}
+ambiguous = int(bool(is_curb and is_ditch))
+curb_override_slope_thresh = float(
+    config.curb_override_slope_mult * config.curb_slope_thresh
+)
+
+curb_priority_override = bool(
+    config.ditch_priority_over_curb
+    and ambiguous
+    and np.isfinite(used_curb_slope)
+    and used_curb_slope >= curb_override_slope_thresh
+)
+
+if config.ditch_priority_over_curb:
+    if curb_priority_override:
+        return curb_result, dbg
+    if is_ditch:
+        return ditch_result(), dbg
+    if is_curb:
+        return curb_result, dbg
+else:
+    if is_curb:
+        return curb_result, dbg
+    if is_ditch:
+        return ditch_result(), dbg
+\end{verbatim}
+
+\subsection{Why Ramp Is the Fallback Class}
+The classifier does not use a separate positive threshold that directly says ``this is a ramp.'' Instead, \textbf{RAMP} is the final class after the station-side has passed all earlier checks and failed the curb and ditch candidate tests.
+
+A station-side is classified as \textbf{RAMP} when:
+\begin{itemize}
+    \item enough sidewalk points exist;
+    \item the lane and sidewalk are not separated by a large gap;
+    \item a stable lateral elevation profile can be built;
+    \item kink metrics are measurable;
+    \item the kink-derived height and slope do not meet the curb threshold;
+    \item the detrended valley geometry does not meet the depressed-ditch threshold.
+\end{itemize}
+
+Thus, \textbf{RAMP} means a connected, measurable station-side transition remains after excluding \textbf{NO\_SIDEWALK}, \textbf{SEPARATED\_NO\_RAMP}, \textbf{UNKNOWN}, \textbf{CURB\_NO\_RAMP}, and \textbf{DEPRESSED\_DITCH}. In practical terms, it represents a smoother pedestrian transition without a strong vertical curb step or a ditch-like valley shape.
+
+\subsection{Relevant Code}
+The main functions for this section are:
+
+\begin{itemize}
+    \item \texttt{estimate\_side\_interface}: estimates lane and sidewalk facing edges, gap, edge elevations, edge height difference, and edge slope;
+    \item \texttt{pick\_two\_kinks}: selects transition kink bounds from curvature extrema of the smoothed profile;
+    \item \texttt{classify\_curb\_from\_interface}: computes the alternate interface-based curb candidate;
+    \item \texttt{summarize\_profile\_geometry}: measures valley depth, curvature, shoulder heights, and ditch widths;
+    \item \texttt{classify\_ditch}: applies depressed-ditch thresholds inside the interface-centered ditch window;
+    \item \texttt{classify\_side}: combines interface, kink, curb, ditch, priority, and fallback-ramp logic for one physical station-side.
+\end{itemize}
+
+\section{Export Products and Station-Side Metrics}
+
+\subsection{Purpose of the Export Stage}
+At this point in the pipeline, every sampled station has been classified on both physical sides. Each station record contains the final right-side and left-side labels, compact side-level metadata, and richer debug metrics when a full profile was available.
+
+The final step of Stage 1 is to convert these internal station records into reusable files. These exports serve two main purposes. First, they allow the rule-based results to be inspected visually in 3D software such as CloudCompare. Second, they provide structured point-level and station-side data for the downstream machine learning stages.
+
+The main export products are:
+\begin{itemize}
+    \item trajectory-level classification products;
+    \item sidewalk point products;
+    \item lane point products;
+    \item station-side metric tables;
+    \item a run-parameter snapshot;
+    \item optional LAS versions of the CloudCompare outputs.
+\end{itemize}
+
+\subsection{Class Encoding and Colors}
+Each rule-based class is assigned both an integer code and an RGB color. The integer code makes the class easy to store in CSV and ASC files, while the RGB values make the result immediately visible in CloudCompare.
+
+The current class encoding is:
+\begin{itemize}
+    \item \textbf{RAMP}: class code 0, green;
+    \item \textbf{CURB\_NO\_RAMP}: class code 1, orange;
+    \item \textbf{SEPARATED\_NO\_RAMP}: class code 2, blue;
+    \item \textbf{NO\_SIDEWALK}: class code 3, red;
+    \item \textbf{DEPRESSED\_DITCH}: class code 4, purple;
+    \item \textbf{UNKNOWN}: class code 5, gray.
+\end{itemize}
+
+\subsubsection{Relevant Code}
+\begin{verbatim}
+CLASS_CODE = {
+    "RAMP": 0,
+    "CURB_NO_RAMP": 1,
+    "SEPARATED_NO_RAMP": 2,
+    "NO_SIDEWALK": 3,
+    "DEPRESSED_DITCH": 4,
+    "UNKNOWN": 5,
+}
+
+CLASS_COLOR = {
+    "RAMP": (0, 210, 0),
+    "CURB_NO_RAMP": (255, 140, 0),
+    "SEPARATED_NO_RAMP": (0, 100, 255),
+    "NO_SIDEWALK": (220, 50, 50),
+    "DEPRESSED_DITCH": (160, 32, 240),
+    "UNKNOWN": (180, 180, 180),
+}
+\end{verbatim}
+
+\subsection{Trajectory Export}
+The trajectory export writes one output point per sampled station. This point is located at the station anchor coordinate:
+\[
+    \mathbf{p}(s) = (x(s), y(s)).
+\]
+
+Because a station has two independent side labels, one for physical \textbf{RIGHT} and one for physical \textbf{LEFT}, the trajectory point also stores both side-level classes:
+\[
+    \texttt{class\_RIGHT},
+    \qquad
+    \texttt{class\_LEFT}.
+\]
+
+For visualization only, the trajectory point is colored by a single dominant class. The dominant class is chosen using the configured priority order. This gives a quick corridor-level overview in CloudCompare, but it does not replace the independent right-side and left-side labels stored in the export table.
+
+The main trajectory outputs are:
+\begin{itemize}
+    \item \texttt{<base>\_traj.csv};
+    \item \texttt{<base>\_traj\_CC.asc}.
+\end{itemize}
+
+\subsubsection{Relevant Code}
+\begin{verbatim}
+class_r = station["class_R"]
+class_l = station["class_L"]
+dom = dominant_class(class_r, class_l)
+
+traj_rows.append({
+    "//X": tx,
+    "Y": ty,
+    "Z": tz,
+    "s_m": round(station["s"], 3),
+    "class_RIGHT": CLASS_CODE.get(class_r, 5),
+    "class_LEFT": CLASS_CODE.get(class_l, 5),
+    "label_R": class_r,
+    "label_L": class_l,
+    "dominant": dom,
+})
+\end{verbatim}
+
+\subsection{Sidewalk and Lane Point Exports}
+The pipeline also exports the actual sidewalk and lane points that were used in the station cross-sections.
+
+For sidewalk points, each exported point stores:
+\begin{itemize}
+    \item real-world coordinate $(x,y,z)$;
+    \item RGB class color;
+    \item station distance \texttt{s\_m};
+    \item local lateral coordinate \texttt{v\_m};
+    \item physical side, either \textbf{RIGHT} or \textbf{LEFT};
+    \item class code and class label;
+    \item ambiguity flag;
+    \item optional sidewalk-cluster metadata.
+\end{itemize}
+
+The sidewalk outputs are:
+\begin{itemize}
+    \item \texttt{<base>\_sidewalk.csv};
+    \item \texttt{<base>\_sidewalk\_CC.asc}.
+\end{itemize}
+
+Lane points are exported separately, but they receive the same station-side class label as the physical side they belong to. This is important for Stage 2 because the CNN dataset builder later needs both lane and sidewalk points aligned by rounded station distance and physical side.
+
+The lane outputs are:
+\begin{itemize}
+    \item \texttt{<base>\_lane.csv};
+    \item \texttt{<base>\_lane\_CC.asc}.
+\end{itemize}
+
+\subsection{Back-Projection to World Coordinates}
+During classification, the pipeline works in the station-local coordinate system. A point is represented mainly by its lateral coordinate $v$ and elevation $z$. For export, the point must be placed back into real-world map coordinates.
+
+The local lateral coordinate used during classification may have been flipped by the orientation step. Therefore, the export first recovers the raw lateral coordinate:
+\[
+    v_{\text{raw}}
+    =
+    v_{\text{oriented}} \cdot \texttt{near\_sign}.
+\]
+
+The point is then projected back into world coordinates using the station anchor and normal vector:
+\[
+    x_{\text{world}}
+    =
+    p_x + v_{\text{raw}}\hat{n}_x,
+\]
+\[
+    y_{\text{world}}
+    =
+    p_y + v_{\text{raw}}\hat{n}_y.
+\]
+
+This is the inverse of the local cross-section representation. It ensures that exported sidewalk and lane points appear in the correct geographic position when opened in CloudCompare.
+
+\subsubsection{Relevant Code}
+\begin{verbatim}
+v_raw = v_sw * near_sign
+world_x = p[0] + v_raw * n_hat[0]
+world_y = p[1] + v_raw * n_hat[1]
+\end{verbatim}
+
+For lane points, the same back-projection is used:
+\begin{verbatim}
+v_lane_raw = v_lane_side * near_sign
+lane_world_x = p[0] + v_lane_raw * n_hat[0]
+lane_world_y = p[1] + v_lane_raw * n_hat[1]
+\end{verbatim}
+
+\subsection{CloudCompare ASC Format}
+Alongside standard CSV files, the pipeline writes CloudCompare-style ASC files. These files are space-separated and use \texttt{//X} as the first coordinate column. The key columns are:
+\[
+    X,\;Y,\;Z,\;R,\;G,\;B.
+\]
+
+The RGB columns allow CloudCompare to display class colors directly. This makes the ASC outputs useful for visual inspection of the classified corridor.
+
+For example, the sidewalk ASC export contains columns such as:
+\begin{verbatim}
+//X Y Z R G B s_m v_m side class cluster_id cluster_role ambiguous
+\end{verbatim}
+
+\subsection{Station-Side Metrics Export}
+The station-side metrics export is the main structured output used by the machine learning stages. Instead of storing one row per point, it stores one row per station-side:
+\[
+    (s_m, \text{side}).
+\]
+
+Thus, each station can contribute up to two metric rows:
+\[
+    (s_m, \text{RIGHT}),
+    \qquad
+    (s_m, \text{LEFT}).
+\]
+
+The outputs are:
+\begin{itemize}
+    \item \texttt{<base>\_station\_side\_metrics.csv};
+    \item \texttt{<base>\_station\_side\_metrics.json}.
+\end{itemize}
+
+Each row contains the final rule-based label and the scalar measurements computed during classification. Important fields include:
+\begin{itemize}
+    \item \texttt{source\_file};
+    \item \texttt{s\_m};
+    \item \texttt{s\_key};
+    \item \texttt{side};
+    \item \texttt{label};
+    \item \texttt{class};
+    \item \texttt{kink\_dz};
+    \item \texttt{kink\_slope};
+    \item \texttt{kink\_width\_m};
+    \item \texttt{kink1\_v}, \texttt{kink2\_v};
+    \item \texttt{gap\_m};
+    \item \texttt{lane\_edge\_v}, \texttt{side\_edge\_v};
+    \item \texttt{interface\_center\_v};
+    \item \texttt{dz\_edge};
+    \item \texttt{edge\_slope};
+    \item \texttt{curb\_from\_interface};
+    \item \texttt{curb\_from\_kink};
+    \item \texttt{curb\_eval\_mode};
+    \item \texttt{ditch\_depth\_m};
+    \item \texttt{ditch\_center\_v};
+    \item \texttt{ditch\_width50\_m};
+    \item \texttt{ditch\_width30\_m};
+    \item \texttt{ditch\_curv};
+    \item \texttt{ambiguous};
+    \item sidewalk-cluster count fields.
+\end{itemize}
+
+\subsubsection{Relevant Code}
+\begin{verbatim}
+rows.append({
+    "source_file": str(config.traj_csv),
+    "s_m": round(float(r["s"]), 3),
+    "s_key": round(float(r["s"]), 3),
+    "side": side_label,
+    "label": label,
+    "class": CLASS_CODE.get(label, 5),
+    "kink_dz": meta.get("dz_m", np.nan),
+    "kink_slope": meta.get("slope", np.nan),
+    "kink_width_m": meta.get("transition_width_m", np.nan),
+    "gap_m": meta.get("gap_m", np.nan),
+    "lane_edge_v": dbg.get("lane_edge_v", np.nan),
+    "side_edge_v": dbg.get("side_edge_v", np.nan),
+    "interface_center_v": dbg.get("interface_center_v", np.nan),
+    "curb_from_interface": dbg.get("curb_from_interface", np.nan),
+    "curb_from_kink": dbg.get("curb_from_kink", np.nan),
+    "ditch_depth_m": meta.get("depth_m", np.nan),
+    "ditch_center_v": meta.get("ditch_center_v", dbg.get("vmin", np.nan)),
+    "ambiguous": meta.get("ambiguous", dbg.get("ambiguous", np.nan)),
+})
+\end{verbatim}
+
+\subsection{Why Non-Winning Metrics Are Exported}
+The station-side metrics table includes measurements even when they did not determine the final class. For example, a station-side classified as \textbf{CURB\_NO\_RAMP} may still contain depressed-ditch metrics, and a station-side classified as \textbf{DEPRESSED\_DITCH} may still contain curb-related measurements.
+
+This is intentional. The rule-based classifier must choose one final label, but the underlying geometry can contain evidence for multiple candidate classes. Exporting the full set of scalar metrics preserves this information for later analysis and machine learning experiments. It also avoids rerunning Stage 1 every time a downstream experiment needs a different engineered feature.
+
+\subsection{Run Parameters and Optional LAS Outputs}
+For reproducibility, the pipeline writes a run-parameter snapshot beside the main outputs:
+\[
+    \texttt{<base>\_run\_params.txt}.
+\]
+
+This file records the configuration values used during the run, including corridor extraction settings, profile construction settings, and classifier thresholds.
+
+The pipeline can also write optional LAS versions of the CloudCompare outputs when LAS export is enabled. These files are:
+\begin{itemize}
+    \item \texttt{<base>\_traj\_CC.las};
+    \item \texttt{<base>\_sidewalk\_CC.las};
+    \item \texttt{<base>\_lane\_CC.las}.
+\end{itemize}
+
+The LAS files contain XYZ coordinates and RGB colors. They are useful when a LAS-based workflow is preferred, but the CSV and ASC products remain the main Stage 1 outputs consumed by later notebooks.
+
+\subsection{Connection to the ML Dataset Stage}
+The Stage 2 dataset builder uses the Stage 1 exports to construct one machine-learning row per station-side. The key alignment fields are:
+\[
+    s_m
+    \qquad
+    \text{and}
+    \qquad
+    \text{side}.
+\]
+
+The lane and sidewalk CSV files provide the point-level profile geometry, while the station-side metrics CSV provides scalar engineered features such as kink height, kink slope, edge metrics, and ditch metrics.
+
+This is why the export stage preserves both point-level products and station-side metric rows. Together, they form the bridge from rule-based corridor processing to the CNN dataset construction stage.
+
+\section{Manual Station-Side Corrections and Remapping}
+
+\subsection{Purpose of the Correction Step}
+The rule-based classifier writes an initial label for every station-side. In practice, some station-sides may need to be corrected after visual inspection of the exported sidewalk and trajectory products. The correction step handles these edits without rerunning the geometry pipeline.
+
+The correction workflow is intentionally sparse. Instead of editing every sidewalk point directly, the pipeline uses a small station-side correction file. Each row says that one station-side should receive a different class. The remapping step then applies that correction to all exported sidewalk points that belong to the matching station-side.
+
+\subsection{Sparse Corrector File}
+The correction file is:
+\[
+    \texttt{<base>\_station\_side\_class\_corrector.csv}.
+\]
+
+It contains only three required columns:
+\[
+    \texttt{s\_m},
+    \qquad
+    \texttt{side},
+    \qquad
+    \texttt{class}.
+\]
+
+The column meanings are:
+\begin{itemize}
+    \item \texttt{s\_m}: station distance of the station-side to correct;
+    \item \texttt{side}: physical side, either \texttt{RIGHT} or \texttt{LEFT};
+    \item \texttt{class}: corrected integer class code.
+\end{itemize}
+
+Only station-sides that need changes are listed. All other station-sides are left unchanged.
+
+For example, if the station spacing is $0.2$ m, a typical correction file might look like:
+\begin{verbatim}
+s_m,side,class
+12.4,RIGHT,2
+18.6,LEFT,0
+\end{verbatim}
+
+This changes the physical right side at station 12.4 m to class 2 and the physical left side at station 18.6 m to class 0.
+
+\subsection{Correction Matching}
+Corrections are matched to exported rows by station distance and side. Internally, both the correction file and the sidewalk export are converted to a normalized key:
+\[
+    s_{\text{key}} = \operatorname{round}(s_m, 3),
+\]
+\[
+    \text{side}_{\text{key}} = \operatorname{uppercase}(\text{side}).
+\]
+
+The correction key is therefore:
+\[
+    (s_{\text{key}}, \text{side}_{\text{key}}).
+\]
+
+The remapper validates that sides are only \texttt{RIGHT} or \texttt{LEFT}, and that class codes exist in the Stage 1 class map. If duplicate correction rows target the same station-side, the last row is kept.
+
+\subsubsection{Relevant Code}
+\begin{verbatim}
+df_map["_s_key"] = df_map["s_m"].astype(float).round(3)
+df_map["_side_key"] = df_map["side"].astype(str).str.upper().str.strip()
+df_map["class"] = df_map["class"].astype(int)
+
+df_map = df_map.drop_duplicates(
+    subset=["_s_key", "_side_key"],
+    keep="last",
+)
+\end{verbatim}
+
+\subsection{Applying Corrections to the Sidewalk Export}
+The main corrected output is the remapped sidewalk file:
+\[
+    \texttt{<base>\_sidewalk\_remapped.csv}.
+\]
+
+The remapper reads the original sidewalk export:
+\[
+    \texttt{<base>\_sidewalk.csv},
+\]
+joins it to the correction table by $(s_{\text{key}}, \text{side}_{\text{key}})$, and updates the class-related columns for matched rows.
+
+For matched sidewalk points, the remapper updates:
+\begin{itemize}
+    \item \texttt{class};
+    \item \texttt{label};
+    \item \texttt{R}, \texttt{G}, and \texttt{B};
+    \item \texttt{color};
+    \item \texttt{cluster\_label}, if present.
+\end{itemize}
+
+The remapper does not recompute geometry. Coordinates, station distance, lateral coordinate, point order, and non-class columns are preserved from the original sidewalk export.
+
+\subsubsection{Relevant Code}
+\begin{verbatim}
+df_out["_s_key"] = df_out["s_m"].astype(float).round(3)
+df_out["_side_key"] = df_out["side"].astype(str).str.upper().str.strip()
+
+df_out = df_out.merge(
+    df_map[["_s_key", "_side_key", "class"]].rename(
+        columns={"class": "class_new"}
+    ),
+    on=["_s_key", "_side_key"],
+    how="left",
+)
+
+matched = df_out["class_new"].notna()
+df_out.loc[matched, "class"] = df_out.loc[matched, "class_new"].astype(int)
+\end{verbatim}
+
+After the class code is changed, the label and RGB color are updated from the class map:
+\begin{verbatim}
+new_label = df_out.loc[matched, "class"].map(INV_MAP)
+df_out.loc[matched, "label"] = new_label
+
+rgb = new_label.map(CLASS_COLOR)
+df_out.loc[matched, "R"] = rgb.map(lambda c: int(c[0]))
+df_out.loc[matched, "G"] = rgb.map(lambda c: int(c[1]))
+df_out.loc[matched, "B"] = rgb.map(lambda c: int(c[2]))
+\end{verbatim}
+
+The remapper also writes a CloudCompare version:
+\[
+    \texttt{<base>\_sidewalk\_remapped\_CC.asc}.
+\]
+
+\subsection{Trajectory Remapping}
+The same correction table can also be applied to the trajectory export. This produces:
+\begin{itemize}
+    \item \texttt{<base>\_traj\_remapped.csv};
+    \item \texttt{<base>\_traj\_remapped\_CC.asc}.
+\end{itemize}
+
+Trajectory remapping updates \texttt{class\_RIGHT} or \texttt{class\_LEFT} for matched station-sides, then recomputes the right and left labels, dominant class, and RGB color used for trajectory visualization.
+
+\subsection{Outputs Not Changed by Remapping}
+The remapping step is limited to corrected sidewalk and trajectory products. It does not change the classifier logic, rerun the profile calculations, rewrite the lane CSV, or rewrite the station-side metrics CSV. The original metrics file remains a record of the rule-based classifier's computed geometry and original decision outputs.
+
+The corrected sidewalk file is the important product for later manual-label workflows:
+\[
+    \texttt{<base>\_sidewalk\_remapped.csv}.
+\]
+
+This file is used as the corrected sidewalk label source for dataset creation and for evaluating the original rule-based labels against manually corrected labels.
+
+\subsection{Relevant Code}
+The correction workflow is implemented in notebook Cells 7, 8, and 8.5, and in the standalone script \texttt{remap\_station\_side\_classes.py}.
+
+The main functions are:
+\begin{itemize}
+    \item \texttt{create\_corrector\_template};
+    \item \texttt{load\_corrector};
+    \item \texttt{apply\_sidewalk\_remap};
+    \item \texttt{remap\_sidewalk};
+    \item \texttt{remap\_trajectory}.
+\end{itemize}
+
+\end{document}
