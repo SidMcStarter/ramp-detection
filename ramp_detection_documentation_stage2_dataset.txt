@@ -1,0 +1,991 @@
+\documentclass{article}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{geometry}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\geometry{margin=1in}
+
+\title{Ramp Detection Documentation: Stage 2 Dataset Construction}
+\author{Siddharth Dileep}
+\date{June 2026}
+
+\begin{document}
+\maketitle
+
+\section{Stage 2: CNN Dataset Construction Overview}
+
+\subsection{Purpose of Stage 2}
+Stage 1 produces rule-based station-side classifications and point-level lane and sidewalk exports. Stage 2 converts those exported products into a machine-learning dataset suitable for CNN training.
+
+The goal is to transform each corrected station-side into one fixed-format row:
+\[
+    (s_m, \text{side}) \rightarrow \text{one CNN sample}.
+\]
+
+Each sample contains two kinds of information:
+\begin{itemize}
+    \item a fixed-length lateral elevation profile built from lane and sidewalk points;
+    \item scalar engineered features exported from the Stage 1 rule-based classifier.
+\end{itemize}
+
+This creates a supervised learning table where every row has a corrected target label, profile channels, scalar features, and station-side metadata.
+
+\subsection{Stage 2 Inputs}
+The dataset builder uses three Stage 1 products from the same segment or full-zone folder:
+\begin{itemize}
+    \item \texttt{<base>\_sidewalk\_remapped.csv};
+    \item \texttt{<base>\_lane.csv};
+    \item \texttt{<base>\_station\_side\_metrics.csv}.
+\end{itemize}
+
+The remapped sidewalk CSV provides the corrected station-side labels used as training targets. The lane CSV provides the road-side point geometry needed to build the lane-to-sidewalk profile. The station-side metrics CSV provides scalar measurements computed during the rule-based stage, such as kink height, kink slope, and interface edge locations.
+
+\subsection{Stage 2 Output}
+The main output is:
+\[
+    \texttt{cnn\_dataset.csv}.
+\]
+
+This file contains one row per retained station-side. A retained station-side is one whose corrected label belongs to the target set used for CNN training. The current target classes are:
+\begin{itemize}
+    \item \textbf{RAMP};
+    \item \textbf{CURB\_NO\_RAMP};
+    \item \textbf{DEPRESSED\_DITCH}.
+\end{itemize}
+
+Other labels, such as \textbf{NO\_SIDEWALK}, \textbf{SEPARATED\_NO\_RAMP}, and \textbf{UNKNOWN}, are not used as CNN training targets in the current dataset builder.
+
+\subsection{One Row Per Station-Side}
+The fundamental sample key is:
+\[
+    (s_m, \text{side}).
+\]
+
+Each station can therefore contribute up to two training samples:
+\[
+    (s_m, \text{RIGHT}),
+    \qquad
+    (s_m, \text{LEFT}).
+\]
+
+This matches the Stage 1 representation, where the right and left sides of the same road station are classified independently. Keeping the same station-side structure is important because a right-side profile may contain a curb while the left-side profile at the same station may contain a ramp, ditch, or no valid target class.
+
+\subsection{Relevant Code}
+The Stage 2 dataset builder is implemented in:
+\begin{itemize}
+    \item \texttt{cnn\_dataset\_from\_remapped\_and\_lane\_csv.py}.
+\end{itemize}
+
+The high-level dataset construction is handled by \texttt{build\_dataset}:
+
+\begin{verbatim}
+df_sw, df_lane, df_metrics = load_and_validate(inputs)
+
+lane_groups = {
+    key: grp.copy()
+    for key, grp in df_lane.groupby(["_s_key", "side"], sort=False)
+}
+
+metrics_lookup = (
+    df_metrics
+    .set_index(["_s_key", "side"])[metric_lookup_cols]
+    .to_dict(orient="index")
+)
+
+for _, group_df in df_sw.groupby(["_s_key", "side"], sort=True):
+    row, status = build_sample(
+        group_df,
+        source_file,
+        lane_groups,
+        metrics_lookup,
+    )
+
+    if row is not None:
+        samples.append(row)
+\end{verbatim}
+
+Conceptually, the dataset builder follows this process:
+\begin{verbatim}
+load remapped sidewalk, lane, and metrics CSVs
+standardize station-side alignment keys
+group sidewalk points by station-side
+look up matching lane points and metrics
+build one fixed-format CNN row for each target station-side
+write cnn_dataset.csv
+\end{verbatim}
+
+\section{Dataset Input Validation and Key Alignment}
+
+\subsection{Purpose of Input Validation}
+Before Stage 2 can build CNN samples, it verifies that the three input CSV files contain the columns needed for station-side grouping, profile construction, target labels, and scalar feature merging. This validation step prevents a dataset from being built with silently missing geometry or missing labels.
+
+The validation and key-standardization logic is handled by \texttt{load\_and\_validate}. It reads the remapped sidewalk CSV, lane CSV, and station-side metrics CSV, checks their required columns, and then creates station-side alignment keys.
+
+\subsection{Required Input Columns}
+The remapped sidewalk file must contain point-level sidewalk geometry and corrected labels. The required sidewalk columns are:
+\begin{itemize}
+    \item \texttt{z};
+    \item \texttt{s\_m};
+    \item \texttt{v\_m};
+    \item \texttt{side};
+    \item \texttt{label};
+    \item \texttt{class}.
+\end{itemize}
+
+The lane file must contain the lane point geometry aligned to the same station-side system. The required lane columns are:
+\begin{itemize}
+    \item \texttt{z};
+    \item \texttt{s\_m};
+    \item \texttt{v\_m};
+    \item \texttt{side}.
+\end{itemize}
+
+The station-side metrics file must contain the scalar values exported from Stage 1. The required metric columns are:
+\begin{itemize}
+    \item \texttt{s\_m};
+    \item \texttt{side};
+    \item \texttt{kink\_dz};
+    \item \texttt{kink\_slope};
+    \item \texttt{lane\_edge\_v};
+    \item \texttt{side\_edge\_v}.
+\end{itemize}
+
+The optional metric column \texttt{interface\_center\_v} is also used when it is present.
+
+\subsubsection{Relevant Code}
+\begin{verbatim}
+REQ_SW_COLS = ["z", "s_m", "v_m", "side", "label", "class"]
+REQ_LANE_COLS = ["z", "s_m", "v_m", "side"]
+REQ_METRIC_COLS = [
+    "s_m",
+    "side",
+    "kink_dz",
+    "kink_slope",
+    "lane_edge_v",
+    "side_edge_v",
+]
+\end{verbatim}
+
+\subsection{Station-Side Alignment Key Standardization}
+The three input files come from related Stage 1 exports, but they are not merged by file row number. They are aligned by station distance and physical side. To make this alignment stable, Stage 2 creates a standardized station key:
+\[
+    s_{\text{key}} = \operatorname{round}(s_m, 3).
+\]
+
+It also standardizes the side string for matching:
+\[
+    \text{side}_{\text{key}} = \operatorname{uppercase}(\operatorname{strip}(\text{side})).
+\]
+
+The final alignment key is therefore:
+\[
+    (s_{\text{key}}, \text{side}_{\text{key}}).
+\]
+
+This is the same station-side identity used throughout the pipeline. It allows sidewalk points, lane points, and scalar metrics to be joined even though they live in separate CSV files. In this section, standardization means making \texttt{s\_m} and \texttt{side} consistent for matching; it does not mean ML feature normalization such as subtracting a mean or dividing by a standard deviation.
+
+\subsubsection{Relevant Code}
+\begin{verbatim}
+df_sw["side"] = df_sw["side"].astype(str).str.strip().str.upper()
+df_sw["_s_key"] = pd.to_numeric(df_sw["s_m"], errors="coerce").round(3)
+
+df_lane["side"] = df_lane["side"].astype(str).str.strip().str.upper()
+df_lane["_s_key"] = pd.to_numeric(df_lane["s_m"], errors="coerce").round(3)
+
+df_metrics["side"] = df_metrics["side"].astype(str).str.strip().str.upper()
+df_metrics["_s_key"] = pd.to_numeric(df_metrics["s_m"], errors="coerce").round(3)
+\end{verbatim}
+
+\subsection{Label and Metric Preparation}
+The sidewalk label is treated as the corrected target label for the CNN sample. The string label is stripped of extra whitespace, and the class column is converted to an integer-like type:
+\begin{verbatim}
+df_sw["label"] = df_sw["label"].astype(str).str.strip()
+df_sw["class"] = pd.to_numeric(df_sw["class"], errors="coerce").astype("Int64")
+\end{verbatim}
+
+The Stage 1 kink metrics are converted to numeric values and stored as absolute magnitudes:
+\[
+    \texttt{kink\_dz} \leftarrow |\texttt{kink\_dz}|,
+    \qquad
+    \texttt{kink\_slope} \leftarrow |\texttt{kink\_slope}|.
+\]
+
+The absolute value is used because the CNN scalar feature branch needs the size of the transition height and slope, not the sign convention of the physical side or lateral coordinate direction.
+
+\subsubsection{Relevant Code}
+\begin{verbatim}
+df_metrics["kink_dz"] = pd.to_numeric(
+    df_metrics["kink_dz"],
+    errors="coerce",
+).abs()
+
+df_metrics["kink_slope"] = pd.to_numeric(
+    df_metrics["kink_slope"],
+    errors="coerce",
+).abs()
+\end{verbatim}
+
+The edge-location metrics are also converted to numeric values when present:
+\begin{verbatim}
+for edge_col in ["lane_edge_v", "side_edge_v", "interface_center_v"]:
+    if edge_col in df_metrics.columns:
+        df_metrics[edge_col] = pd.to_numeric(
+            df_metrics[edge_col],
+            errors="coerce",
+        )
+\end{verbatim}
+
+\subsection{Lane and Metric Lookups}
+After validation, the lane points are grouped by standardized station-side alignment key:
+\[
+    (s_{\text{key}}, \text{side}).
+\]
+
+This produces a lookup table that lets each sidewalk station-side retrieve the matching lane points. The metrics table is converted into a second lookup table using the same key.
+
+If duplicate metric rows exist for the same station-side, the last row is kept:
+\begin{verbatim}
+df_metrics = df_metrics.drop_duplicates(
+    subset=["_s_key", "side"],
+    keep="last",
+)
+\end{verbatim}
+
+The final lookup construction is:
+\begin{verbatim}
+lane_groups = {
+    key: grp.copy()
+    for key, grp in df_lane.groupby(["_s_key", "side"], sort=False)
+}
+
+metrics_lookup = (
+    df_metrics
+    .set_index(["_s_key", "side"])[metric_lookup_cols]
+    .to_dict(orient="index")
+)
+\end{verbatim}
+
+The sidewalk file remains the driver of sample creation. Stage 2 iterates over remapped sidewalk station-side groups, then pulls in lane points and scalar metrics using the same alignment key. This ensures that the corrected label, lateral profile, and engineered scalar features all end up in the same final CNN row.
+
+\section{Target Labels and Sample Filtering}
+
+\subsection{Purpose of Filtering}
+After the input files are validated and station-side alignment keys are prepared, Stage 2 loops over the remapped sidewalk points grouped by:
+\[
+    (s_{\text{key}}, \text{side}).
+\]
+
+Each group represents one corrected station-side candidate. Not every candidate becomes a CNN training row. The dataset builder applies two different kinds of filtering:
+\begin{itemize}
+    \item label filtering, which removes station-sides whose corrected class is outside the current CNN target set;
+    \item geometry filtering, which removes station-sides that cannot produce any valid profile bins.
+\end{itemize}
+
+These filters answer different questions. Label filtering asks whether the station-side belongs to the learning problem being trained. Geometry filtering asks whether the station-side has enough usable point data to form a numerical CNN input.
+
+\subsection{Selecting the Station-Side Label}
+Since the remapped sidewalk CSV is point-level, one station-side can contain many sidewalk point rows. Stage 2 groups these rows by:
+\[
+    (s_{\text{key}}, \text{side})
+\]
+and assigns one label to the whole group.
+
+The selected label is the one that appears most often in that group. This same idea is also applied to the integer class code:
+\begin{verbatim}
+label = mode_or_first(group_df["label"])
+class_mode = mode_or_first(group_df["class"])
+\end{verbatim}
+
+In a clean remapped file produced from Stage 1 outputs, all points in the group should already have the same label. Therefore, this step is mainly a safeguard against rare point-level inconsistencies in the export or manual correction process.
+
+\subsection{Target-Label Filtering}
+The current CNN dataset is trained only on three target classes:
+\begin{itemize}
+    \item \textbf{RAMP};
+    \item \textbf{CURB\_NO\_RAMP};
+    \item \textbf{DEPRESSED\_DITCH}.
+\end{itemize}
+
+In code, this target set is:
+\begin{verbatim}
+TARGET_LABELS = ["RAMP", "CURB_NO_RAMP", "DEPRESSED_DITCH"]
+\end{verbatim}
+
+If the corrected station-side label is not in this list, the sample is dropped with the status \texttt{dropped\_non\_target}:
+\begin{verbatim}
+if label not in TARGET_LABELS:
+    return None, "dropped_non_target"
+\end{verbatim}
+
+This means labels such as \textbf{NO\_SIDEWALK}, \textbf{SEPARATED\_NO\_RAMP}, and \textbf{UNKNOWN} are excluded from the current CNN training table. They are not being treated as negative examples in this dataset version. They are outside the target classification problem being prepared for training.
+
+\subsection{Zero-Valid Geometry Filtering}
+The second filtering path is different, and it should be rare for clean Stage 1 exports. A station-side may have a valid target label, such as \textbf{RAMP}, but still fail to produce usable profile data. This safeguard prevents the dataset from keeping a CNN row whose profile channels contain no observed geometric support.
+
+A zero-valid drop does not mean the station-side had no rows in the remapped sidewalk CSV. It means that after finite filtering, optional sidewalk-edge cropping, and fixed-width binning, no profile bin contained enough points to produce a valid median elevation.
+
+This can happen if the point arrays are empty after finite filtering, if the matching lane data is missing and the sidewalk group has no usable coordinates, if the sidewalk-edge crop leaves no points in the profile window, or if the remaining points are too sparse for any bin to satisfy the minimum point count.
+
+Stage 2 first prepares side-local sidewalk and lane arrays. If both arrays are empty before profile construction, the sample is dropped immediately:
+\begin{verbatim}
+if len(sw_v) == 0 and len(lane_v) == 0:
+    return None, "dropped_zero_valid"
+\end{verbatim}
+
+After the profile is binned, the script counts how many bins received enough points:
+\[
+    N_{\text{valid bins}}
+    =
+    \sum_j \mathbf{1}(\text{bin } j \text{ has valid median elevation}).
+\]
+
+In code, this is:
+\begin{verbatim}
+n_valid_bins = int(mask.sum())
+\end{verbatim}
+
+If \texttt{DROP\_ZERO\_VALID} is enabled and no bins are valid, the sample is also dropped as \texttt{dropped\_zero\_valid}:
+\begin{verbatim}
+if DROP_ZERO_VALID and n_valid_bins == 0:
+    return None, "dropped_zero_valid"
+\end{verbatim}
+
+This is a geometry failure, not a label decision. The corrected class may still be one of the target classes, but the CNN cannot train on a row whose profile channels contain no observed geometric support. In normal clean outputs, this should occur only occasionally. If it occurs often, it usually indicates a data alignment problem, sparse point exports, an edge-buffer issue, or profile settings that are too strict for the available point density.
+
+\subsection{Difference Between Non-Target and Zero-Valid Drops}
+The two drop statuses should not be interpreted the same way.
+
+\texttt{dropped\_non\_target} means the station-side has a label outside the current training label set. For example, a corrected \textbf{NO\_SIDEWALK} station-side is dropped because the current CNN dataset is only training on \textbf{RAMP}, \textbf{CURB\_NO\_RAMP}, and \textbf{DEPRESSED\_DITCH}.
+
+\texttt{dropped\_zero\_valid} means the station-side passed the target-label check, or reached the profile-construction stage, but had no usable geometry for the fixed CNN profile. For example, a station-side labeled \textbf{RAMP} can still be dropped if no finite sidewalk or lane points survive the profile-building process, or if all remaining points are too sparse to create even one valid bin. This is a defensive safeguard, not an expected outcome for most clean Stage 1 station-sides.
+
+In short:
+\begin{itemize}
+    \item \texttt{dropped\_non\_target}: the label is outside the learning task;
+    \item \texttt{dropped\_zero\_valid}: the label may be usable, but the geometry cannot form a usable CNN input.
+\end{itemize}
+
+\subsection{Filtering Statistics}
+The script tracks filtering outcomes with a counter:
+\begin{verbatim}
+stats = Counter({
+    "total_groups": 0,
+    "kept": 0,
+    "dropped_non_target": 0,
+    "dropped_zero_valid": 0,
+})
+\end{verbatim}
+
+During dataset construction, every sidewalk station-side group increments \texttt{total\_groups}. The result from \texttt{build\_sample} increments one of the outcome counters:
+\begin{verbatim}
+for _, group_df in df_sw.groupby(["_s_key", "side"], sort=True, dropna=False):
+    stats["total_groups"] += 1
+    row, status = build_sample(group_df, source_file, lane_groups, metrics_lookup)
+    stats[status] += 1
+
+    if row is not None:
+        samples.append(row)
+\end{verbatim}
+
+These counts are useful for auditing dataset construction. A high \texttt{dropped\_non\_target} count usually means the source segment contains many station-sides outside the current target classes. A high \texttt{dropped\_zero\_valid} count is different: because zero-valid drops should be rare in clean Stage 1 outputs, a large value points to missing or sparse point geometry, edge-buffer crop problems, station-side alignment issues, or overly strict binning settings.
+
+\section{Side-Local Lane and Sidewalk Profile Assembly}
+
+\subsection{Purpose of Side-Local Profiles}
+After a station-side passes the target-label check, Stage 2 prepares the point geometry that will become the CNN profile. The input still comes from Stage 1 point-level exports, where each row has a lateral coordinate \texttt{v\_m}, an elevation \texttt{z}, a station distance \texttt{s\_m}, and a physical side.
+
+For CNN dataset construction, the goal is to make right-side and left-side samples comparable. A curb or ramp on the right side and a similar curb or ramp on the left side should have the same profile shape from the model's point of view. Therefore, Stage 2 converts the lateral coordinate into a side-local coordinate:
+\[
+    v_{\text{local}} = |v_m|.
+\]
+
+The physical side is not discarded. It remains stored in the metadata column \texttt{side}. Only the coordinate used to build the binned profile is made side-local.
+
+\subsection{Finite Coordinate Filtering}
+Before using the point coordinates, Stage 2 removes invalid lateral coordinates and elevations. A point is kept only if both \texttt{v\_m} and \texttt{z} are finite:
+\[
+    \operatorname{isfinite}(v_m)
+    \land
+    \operatorname{isfinite}(z).
+\]
+
+This is another safeguard for malformed rows. Clean Stage 1 exports should normally contain valid values, but the check prevents invalid numbers from entering the CNN profile.
+
+\subsubsection{Relevant Code}
+This preparation is handled by \texttt{prepare\_profile\_arrays}:
+\begin{verbatim}
+def prepare_profile_arrays(v, z):
+    v = np.asarray(v, dtype=float)
+    z = np.asarray(z, dtype=float)
+    keep = np.isfinite(v) & np.isfinite(z)
+    return np.abs(v[keep]), z[keep]
+\end{verbatim}
+
+The returned lateral coordinate is already side-local because the function returns \texttt{np.abs(v[keep])}.
+
+\subsection{Why the Absolute Lateral Coordinate Is Used}
+Using \(|v_m|\) lets both physical sides use the same positive lateral coordinate system. For example:
+\begin{verbatim}
+RIGHT point: v_m =  2.4  ->  v_local = 2.4
+LEFT point : v_m = -2.4  ->  v_local = 2.4
+\end{verbatim}
+
+This avoids making the CNN learn separate sign conventions for the two sides of the road. The model sees a side-local profile shape, while the \texttt{side} column still records whether the sample came from the physical \textbf{RIGHT} or \textbf{LEFT} side.
+
+\subsection{Retrieving Matching Lane Points}
+The remapped sidewalk group drives sample creation. For each sidewalk station-side group, Stage 2 looks up lane points using the same alignment key:
+\[
+    (s_{\text{key}}, \text{side}).
+\]
+
+If matching lane points exist, their \texttt{v\_m} and \texttt{z} values are prepared with the same side-local conversion. If no matching lane group exists, the script uses empty lane arrays. Missing lane points do not immediately drop the sample as long as the sidewalk geometry can still produce a valid profile.
+
+\subsubsection{Relevant Code}
+\begin{verbatim}
+lane_df = lane_groups.get((s_key, side), None)
+
+if lane_df is None:
+    lane_v = np.array([], dtype=float)
+    lane_z = np.array([], dtype=float)
+else:
+    lane_v, lane_z = prepare_profile_arrays(
+        lane_df["v_m"].to_numpy(),
+        lane_df["z"].to_numpy(),
+    )
+\end{verbatim}
+
+\subsection{Merging Sidewalk and Lane Points}
+The CNN profile is built from both sidewalk and lane geometry. The sidewalk points describe the pedestrian-side surface, while the lane points describe the road-side surface. After both are converted to side-local coordinates, they are merged into one raw profile input:
+\[
+    v_{\text{all}} = [v_{\text{sidewalk}}, v_{\text{lane}}],
+\]
+\[
+    z_{\text{all}} = [z_{\text{sidewalk}}, z_{\text{lane}}].
+\]
+
+In code, the sidewalk arrays are always present because the loop is driven by sidewalk groups. Lane arrays are added when matching lane points are available:
+\begin{verbatim}
+v_all = np.concatenate([sw_v, lane_v]) if len(lane_v) > 0 else sw_v.copy()
+z_all = np.concatenate([sw_z, lane_z]) if len(lane_z) > 0 else sw_z.copy()
+\end{verbatim}
+
+At this point, \((v_{\text{all}}, z_{\text{all}})\) is still raw point data. It has not yet been cropped, binned, interpolated, padded, or smoothed.
+
+\subsection{Connection to the Next Step}
+The result of this section is one side-local raw elevation point set for a single station-side:
+\[
+    (v_{\text{all}}, z_{\text{all}}).
+\]
+
+The next step is to crop this raw point set around the Stage 1 sidewalk edge. That crop creates the fixed 25-bin window used by the CNN dataset.
+
+\section{Sidewalk-Edge Buffer and Fixed 25-Bin Window}
+
+\subsection{Purpose of the Sidewalk-Edge Buffer}
+After side-local assembly, Stage 2 has one raw point set for the station-side:
+\[
+    (v_{\text{all}}, z_{\text{all}}).
+\]
+
+This raw profile can include points that are far from the lane-sidewalk transition. For CNN training, the most important region is the transition area near the sidewalk edge. Stage 1 already estimates this edge and exports it as \texttt{side\_edge\_v}. Stage 2 uses that value to crop the raw profile around the transition.
+
+The buffer does not change the label. It only chooses which lateral part of the station-side profile is given to the CNN.
+
+\subsection{Current Buffer Configuration}
+The current dataset builder uses a sidewalk-edge-centered profile by default:
+\begin{verbatim}
+BIN_SIZE = 0.08
+SIDEWALK_EDGE_N_BINS = 25
+USE_SIDEWALK_EDGE_BUFFER = True
+SIDEWALK_EDGE_BUFFER_M = 1.0
+N_BINS = SIDEWALK_EDGE_N_BINS
+\end{verbatim}
+
+With 25 bins and a bin width of 0.08 m, the CNN profile has a total nominal width of:
+\[
+    25 \times 0.08 = 2.0 \text{ m}.
+\]
+
+Thus, the model receives a focused 2.0 m lateral window around the Stage 1 sidewalk edge rather than the full station-side profile.
+
+\subsection{Buffer Center}
+Because Stage 2 uses side-local coordinates, the sidewalk edge is also converted to a side-local magnitude:
+\[
+    v_{\text{center}} = |v_{\text{side edge}}|.
+\]
+
+This makes the buffer logic the same for physical \textbf{RIGHT} and physical \textbf{LEFT} samples. The original physical side is still stored in the output metadata column \texttt{side}.
+
+\subsection{Buffer Start and End}
+The buffer extends 1.0 m before and 1.0 m after the side-local sidewalk edge:
+\[
+    v_{\text{start}}
+    =
+    \max(0,
+    |v_{\text{side edge}}| - 1.0),
+\]
+\[
+    v_{\text{end}}
+    =
+    |v_{\text{side edge}}| + 1.0.
+\]
+
+The lower bound is clipped at zero because the side-local profile starts at \(v=0\). If the sidewalk edge is less than 1.0 m from zero, the actual crop width can be smaller than 2.0 m on the near side. The script records the resulting width in \texttt{buffer\_width\_m}.
+
+\subsubsection{Relevant Code}
+\begin{verbatim}
+side_edge_abs = abs(float(side_edge_v))
+buffer_start_v = max(0.0, side_edge_abs - float(buffer_m))
+buffer_end_v = side_edge_abs + float(buffer_m)
+\end{verbatim}
+
+\subsection{Cropping and Coordinate Shift}
+Points are kept if their side-local lateral coordinate falls inside the buffer:
+\[
+    v_{\text{start}}
+    \le
+    v_{\text{all}}
+    \le
+    v_{\text{end}}.
+\]
+
+After cropping, the coordinate is shifted so the buffer starts at zero:
+\[
+    v_{\text{crop}} = v_{\text{all}} - v_{\text{start}}.
+\]
+
+This shift is important because the later binning step always begins at \(v=0\). Every cropped profile is therefore represented in the same local window coordinate system.
+
+\subsubsection{Relevant Code}
+\begin{verbatim}
+keep_buffer = (v_all >= buffer_start_v) & (v_all <= buffer_end_v)
+
+if not np.any(keep_buffer):
+    return v_all, z_all, buffer_info
+
+buffer_info["buffer_applied"] = 1
+return v_all[keep_buffer] - buffer_start_v, z_all[keep_buffer], buffer_info
+\end{verbatim}
+
+\subsection{Buffer Metadata}
+The script records buffer metadata in the output row. These fields make the crop auditable later:
+\begin{itemize}
+    \item \texttt{profile\_mode};
+    \item \texttt{sidewalk\_edge\_buffer\_m};
+    \item \texttt{buffer\_applied};
+    \item \texttt{buffer\_start\_v};
+    \item \texttt{buffer\_end\_v};
+    \item \texttt{buffer\_width\_m};
+    \item \texttt{sidewalk\_edge\_center\_v};
+    \item \texttt{sidewalk\_edge\_center\_bin}.
+\end{itemize}
+
+The center-bin field records where the Stage 1 sidewalk edge falls inside the cropped CNN window:
+\[
+    \text{sidewalk edge center bin}
+    =
+    \left\lfloor
+    \frac{|v_{\text{side edge}}| - v_{\text{start}}}{0.08}
+    \right\rfloor.
+\]
+
+This is useful for checking whether the transition is positioned as expected inside the 25-bin profile.
+
+\subsubsection{Relevant Code}
+\begin{verbatim}
+buffer_info.update({
+    "buffer_start_v": float(buffer_start_v),
+    "buffer_end_v": float(buffer_end_v),
+    "buffer_width_m": float(buffer_end_v - buffer_start_v),
+    "sidewalk_edge_center_v": float(side_edge_abs - buffer_start_v),
+    "sidewalk_edge_center_bin": int(
+        np.floor((side_edge_abs - buffer_start_v) / BIN_SIZE)
+    ),
+})
+\end{verbatim}
+
+\subsection{When the Buffer Is Not Applied}
+The buffer step has safeguards. If sidewalk-edge buffering is disabled, or if \texttt{side\_edge\_v} is missing, the function returns the original side-local point set. If no points fall inside the proposed buffer, it also returns the original point set and leaves \texttt{buffer\_applied = 0}.
+
+These fallbacks prevent the dataset builder from discarding all profile geometry just because the edge value is missing or the crop window is empty. In clean Stage 1 outputs, the buffer is expected to apply for most target station-sides.
+
+\subsubsection{Relevant Code}
+\begin{verbatim}
+if not USE_SIDEWALK_EDGE_BUFFER or pd.isna(side_edge_v):
+    return v_all, z_all, buffer_info
+
+keep_buffer = (v_all >= buffer_start_v) & (v_all <= buffer_end_v)
+if not np.any(keep_buffer):
+    return v_all, z_all, buffer_info
+\end{verbatim}
+
+\subsection{Connection to Binning}
+The buffer step defines the lateral window. It does not yet create the CNN channels. After this step, Stage 2 has either cropped side-local points or the original side-local points if the buffer was not applied.
+
+The next step converts those points into fixed bin channels using median binning, internal interpolation, gap flags, and padding flags.
+
+\section{Binning, Interpolation, Gap Flags, and Padding}
+
+\subsection{Purpose of Fixed Binning}
+After the sidewalk-edge buffer, Stage 2 has a side-local point set for one station-side:
+\[
+    (v_{\text{profile}}, z_{\text{profile}}).
+\]
+
+These are still irregular point-cloud samples. The CNN cannot consume a variable number of points per station-side, so Stage 2 converts the profile into a fixed-length vector. In the current configuration, every retained station-side is represented with:
+\[
+    N_{\text{bins}} = 25,
+    \qquad
+    \Delta v = 0.08 \text{ m}.
+\]
+
+This gives the CNN a fixed 25-bin elevation profile for every sample.
+
+\subsection{Median Elevation Per Bin}
+Each point is assigned to a lateral bin based on its side-local coordinate:
+\[
+    j = \left\lfloor \frac{v}{0.08} \right\rfloor.
+\]
+
+A bin is treated as valid only if it contains at least three points:
+\[
+    N_j \ge 3.
+\]
+
+For a valid bin, the bin elevation is the median elevation of the points in that bin:
+\[
+    z_j
+    =
+    \operatorname{median}
+    \left(
+        \{z_i : i \in \text{bin } j\}
+    \right).
+\]
+
+The median is used instead of the mean to reduce the effect of isolated high or low points.
+
+\subsection{Example: From Cropped Coordinate to Bin Index}
+The bin index is computed after the side-local coordinate has been cropped and shifted into the sidewalk-edge buffer window. For example, suppose Stage 1 estimated:
+\[
+    |v_{\text{side edge}}| = 14.2 \text{ m}.
+\]
+
+With a 1.0 m sidewalk-edge buffer, the crop begins at:
+\[
+    v_{\text{start}} = 14.2 - 1.0 = 13.2 \text{ m}.
+\]
+
+Now suppose one point has:
+\[
+    v_m = 14.36 \text{ m}.
+\]
+
+Stage 2 first uses the side-local value:
+\[
+    v_{\text{local}} = |14.36| = 14.36 \text{ m}.
+\]
+
+Then it shifts the point into the cropped CNN window:
+\[
+    v_{\text{crop}} = 14.36 - 13.2 = 1.16 \text{ m}.
+\]
+
+The bin index is then:
+\[
+    j = \left\lfloor \frac{1.16}{0.08} \right\rfloor
+    =
+    \left\lfloor 14.5 \right\rfloor
+    = 14.
+\]
+
+So this point contributes to bin 14 of the 25-bin CNN profile. Without the crop-and-shift step, the original coordinate would give a much larger index and would not fit into the 25-bin model window.
+
+\subsection{Example: Gap and Padding Flags}
+After binning, some bins may be observed directly, some may be filled by interpolation, and some may be padding. For example, suppose a shorter 8-bin illustration has valid observed bins at:
+\[
+    0,
+    1,
+    3,
+    4,
+    5.
+\]
+
+Bin 2 is inside the observed profile span, but it did not have enough points. Since it lies between valid bins 1 and 3, it is filled by interpolation and marked as a gap:
+\[
+    \text{gap}_2 = 1.
+\]
+
+The last valid bin is bin 5. Bins 6 and 7 are after the observed profile ends, so they are set to zero and marked as padding:
+\[
+    \text{pad}_6 = 1,
+    \qquad
+    \text{pad}_7 = 1.
+\]
+
+In this example:
+\begin{verbatim}
+bin index:  0  1  2  3  4  5  6  7
+observed :  1  1  0  1  1  1  0  0
+gap      :  0  0  1  0  0  0  0  0
+pad      :  0  0  0  0  0  0  1  1
+\end{verbatim}
+
+This distinction matters because a gap is missing data inside the observed profile, while padding is outside the observed profile extent. With the current 25-bin sidewalk-edge window, both gap and padding flags are usually rare, but the channels remain in the dataset so the CNN input format stays consistent and sparse cases remain explicit.
+
+\subsubsection{Relevant Code}
+\begin{verbatim}
+bin_idx = np.floor(v / bin_size).astype(int)
+bin_idx = np.clip(bin_idx, 0, n_bins - 1)
+
+for i in range(n_bins):
+    sel = bin_idx == i
+    count = int(sel.sum())
+    counts[i] = count
+    if count >= min_pts_per_bin:
+        z_bins[i] = float(np.median(z[sel]))
+        mask[i] = 1
+\end{verbatim}
+
+\subsection{Valid-Bin Mask}
+The binning step also creates a mask. For each bin \(j\):
+\[
+    \text{mask}_j = 1
+\]
+means the bin had enough observed points to produce a median elevation. A value of:
+\[
+    \text{mask}_j = 0
+\]
+means the bin was empty or too sparse.
+
+The total number of valid bins is stored as:
+\begin{verbatim}
+n_valid_bins = int(mask.sum())
+\end{verbatim}
+
+This value is also used by the \texttt{dropped\_zero\_valid} safeguard. If no bins are valid, the station-side does not have usable observed geometry for CNN training.
+
+\subsection{Internal Interpolation}
+If at least one valid bin exists, Stage 2 finds the last valid bin:
+\[
+    j_{\text{last}}
+    =
+    \max\{j : \text{mask}_j = 1\}.
+\]
+
+Missing bins from the start of the profile through \(j_{\text{last}}\) are filled by linear interpolation. This fills internal gaps only. It does not extend the observed profile beyond the last valid bin.
+
+\subsubsection{Relevant Code}
+\begin{verbatim}
+valid_idx = np.flatnonzero(mask == 1)
+last_valid_bin = int(valid_idx[-1])
+
+x = np.arange(last_valid_bin + 1, dtype=float)
+z_out[: last_valid_bin + 1] = np.interp(
+    x,
+    valid_idx.astype(float),
+    z_bins[valid_idx],
+)
+\end{verbatim}
+
+\subsection{Gap Flags}
+The \texttt{gap\_*} channels record which bins were missing originally and then filled by interpolation. For bins through \texttt{last\_valid\_bin}:
+\[
+    \text{gap}_j = 1
+\]
+means bin \(j\) was not observed directly but was filled from neighboring valid bins. Observed bins have:
+\[
+    \text{gap}_j = 0.
+\]
+
+Padding bins after \texttt{last\_valid\_bin} are not treated as gaps.
+
+\subsubsection{Relevant Code}
+\begin{verbatim}
+gap_flag[: last_valid_bin + 1] = (
+    mask[: last_valid_bin + 1] == 0
+).astype(np.uint8)
+\end{verbatim}
+
+\subsection{Padding Flags}
+Bins after the last valid bin are outside the observed profile extent. These bins are set to zero and marked as padding:
+\[
+    \text{pad}_j = 1
+    \qquad
+    \text{for } j > j_{\text{last}}.
+\]
+
+Padding is different from a gap. A gap is a missing bin inside the observed profile span. Padding is the trailing region after the observed profile has ended. The padding flag tells the CNN that the zero elevation values in those bins are not real observed elevations.
+
+\subsubsection{Relevant Code}
+\begin{verbatim}
+pad_flag[last_valid_bin + 1 :] = 1
+z_out[last_valid_bin + 1 :] = 0.0
+\end{verbatim}
+
+\subsection{Smoothing Only Through the Last Valid Bin}
+After interpolation, Stage 2 applies Savitzky-Golay smoothing only through \texttt{last\_valid\_bin}. The padded tail remains zero. This prevents smoothing from spreading real elevation values into padded bins.
+
+The current smoothing parameters are:
+\[
+    \texttt{SG\_WINDOW} = 11,
+    \qquad
+    \texttt{SG\_POLY} = 4.
+\]
+
+\subsubsection{Relevant Code}
+\begin{verbatim}
+valid_len = last_valid_bin + 1
+if valid_len >= sg_window and sg_window % 2 == 1 and sg_window > sg_poly:
+    z_s[:valid_len] = savgol_filter(
+        z_s[:valid_len],
+        window_length=sg_window,
+        polyorder=sg_poly,
+        mode="interp",
+    )
+
+z_s[last_valid_bin + 1 :] = 0.0
+\end{verbatim}
+
+\subsection{Final CNN Profile Channels}
+The final profile representation has three per-bin channel groups:
+\[
+    \texttt{z\_000}, \dots, \texttt{z\_024},
+\]
+\[
+    \texttt{gap\_000}, \dots, \texttt{gap\_024},
+\]
+\[
+    \texttt{pad\_000}, \dots, \texttt{pad\_024}.
+\]
+
+The \texttt{z\_*} columns contain the smoothed elevation profile. The \texttt{gap\_*} columns mark bins filled by interpolation. The \texttt{pad\_*} columns mark trailing bins beyond the observed profile extent.
+
+The \texttt{gap\_*} and \texttt{pad\_*} channels were more important when the dataset used a much wider profile with many more bins. With the current 25-bin sidewalk-edge window, gaps and padding are usually rare because the crop is focused near the transition. They are still kept for consistency with the model input format and as safeguards for occasional sparse or shortened profiles.
+
+\subsubsection{Relevant Code}
+\begin{verbatim}
+row = {f"z_{i:03d}": float(z_s[i]) for i in range(N_BINS)}
+row.update({f"gap_{i:03d}": int(gap_flag[i]) for i in range(N_BINS)})
+row.update({f"pad_{i:03d}": int(pad_flag[i]) for i in range(N_BINS)})
+\end{verbatim}
+
+At the end of this step, every retained station-side has the same fixed-length profile representation: 25 elevation values, 25 gap flags, and 25 padding flags. The next section explains how these profile channels are combined with scalar Stage 1 features and metadata to form the final dataset row.
+
+\section{Final Dataset Rows and Output CSV}
+
+\subsection{Purpose of the Final Row}
+After profile construction, each retained station-side has three fixed-length channel groups:
+\begin{itemize}
+    \item \texttt{z\_000} through \texttt{z\_024};
+    \item \texttt{gap\_000} through \texttt{gap\_024};
+    \item \texttt{pad\_000} through \texttt{pad\_024}.
+\end{itemize}
+
+The final row adds the corrected target label, scalar Stage 1 features, buffer and edge metadata, and station-side audit fields. This turns one corrected station-side into one complete machine-learning sample.
+
+\subsection{Target Label Columns}
+The target label columns are:
+\begin{itemize}
+    \item \texttt{label}: the corrected remapped class name for the station-side;
+    \item \texttt{class\_int}: the integer class code used by the training notebook.
+\end{itemize}
+
+These values come from the remapped sidewalk group after the group has been collapsed to one station-side sample.
+
+\subsection{Scalar Engineered Features}
+The final row also includes two scalar engineered features from the Stage 1 station-side metrics table:
+\begin{itemize}
+    \item \texttt{feat\_kink\_dz};
+    \item \texttt{feat\_kink\_slope}.
+\end{itemize}
+
+These are derived from the Stage 1 \texttt{kink\_dz} and \texttt{kink\_slope} fields. They are stored as absolute magnitudes, so the feature represents the size of the transition rather than the sign convention of the physical side.
+
+These scalar features let the training notebook use compact rule-based geometric evidence alongside the binned CNN profile.
+
+\subsection{Buffer and Edge Metadata}
+The row keeps the buffer and edge fields used to construct the 25-bin profile:
+\begin{itemize}
+    \item \texttt{profile\_mode};
+    \item \texttt{sidewalk\_edge\_buffer\_m};
+    \item \texttt{buffer\_applied};
+    \item \texttt{buffer\_start\_v};
+    \item \texttt{buffer\_end\_v};
+    \item \texttt{buffer\_width\_m};
+    \item \texttt{sidewalk\_edge\_center\_v};
+    \item \texttt{sidewalk\_edge\_center\_bin};
+    \item \texttt{lane\_edge\_v};
+    \item \texttt{side\_edge\_v};
+    \item \texttt{interface\_center\_v}.
+\end{itemize}
+
+These columns are mainly for context and auditing. They make it possible to check how the 25-bin profile was positioned relative to the Stage 1 lane-sidewalk interface.
+
+\subsection{Station-Side Audit Columns}
+The final row also stores fields that identify where the sample came from and how much point support it had:
+\begin{itemize}
+    \item \texttt{s\_m};
+    \item \texttt{side};
+    \item \texttt{source\_file};
+    \item \texttt{n\_valid\_bins};
+    \item \texttt{last\_valid\_bin};
+    \item \texttt{n\_sidewalk\_pts};
+    \item \texttt{n\_lane\_pts}.
+\end{itemize}
+
+These columns help trace a row back to the original segment and station-side. They also help diagnose sparse or shortened profiles.
+
+\subsection{Final Row Assembly}
+The final row is assembled by first writing the profile channels and then adding labels, features, and metadata:
+\begin{verbatim}
+row = {f"z_{i:03d}": float(z_s[i]) for i in range(N_BINS)}
+row.update({f"gap_{i:03d}": int(gap_flag[i]) for i in range(N_BINS)})
+row.update({f"pad_{i:03d}": int(pad_flag[i]) for i in range(N_BINS)})
+
+row.update({
+    "label": label,
+    "class_int": class_mode,
+    "feat_kink_dz": feat_kink_dz,
+    "feat_kink_slope": feat_kink_slope,
+    **buffer_info,
+    "lane_edge_v": lane_edge_v,
+    "side_edge_v": side_edge_v,
+    "interface_center_v": interface_center_v,
+    "s_m": s_val,
+    "side": side,
+    "source_file": source_file,
+    "n_valid_bins": n_valid_bins,
+    "last_valid_bin": int(last_valid_bin),
+    "n_sidewalk_pts": int(len(sw_v)),
+    "n_lane_pts": int(len(lane_v)),
+})
+\end{verbatim}
+
+The actual implementation includes checks that write missing scalar or edge values as \texttt{NaN} when the metric is unavailable.
+
+\subsection{Final Column Order}
+The output CSV uses a fixed column order:
+\begin{verbatim}
+PROFILE_COLS + GAP_COLS + PAD_COLS + META_COLS
+\end{verbatim}
+
+This means the profile channels appear first, followed by gap flags, padding flags, and metadata. The fixed ordering keeps the training notebook's input parsing simple and consistent.
+
+\subsection{Writing the Dataset}
+All retained rows are collected into \texttt{samples}, converted into a DataFrame, ordered, and written to CSV:
+\begin{verbatim}
+df_cnn = pd.DataFrame(samples)
+
+if not df_cnn.empty:
+    df_cnn = df_cnn[PROFILE_COLS + GAP_COLS + PAD_COLS + META_COLS]
+
+df_cnn.to_csv(inputs.output_csv, index=False)
+\end{verbatim}
+
+The final output, \texttt{cnn\_dataset.csv}, is the Stage 2 product consumed by the PyTorch training stage. Each row is one corrected station-side sample with fixed profile channels, scalar Stage 1 features, and enough metadata to trace the sample back to its original station and source file.
+
+\end{document}
